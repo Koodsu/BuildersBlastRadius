@@ -35,9 +35,10 @@ import time
 import types
 
 from br import analyze, cells
-from br.policy import plan_slices
+from br.policy import plan_slices, slice_cost
 
 HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")
+CONTINUE_RATIO = float(os.environ.get("BR_CONTINUE", "0.3"))
 
 
 def make_tree(base, dest, patched):
@@ -147,7 +148,7 @@ def _function_runners(maps, state, module, qualname, attr):
     """Tests that run the function a changed cell holds, or None if it is not one.
 
     A function whose defaults or closure changed can only matter to tests that
-    call it. Tests that ran it while importing something are included.
+    call it.
     """
     owner = sys.modules.get(module)
     for part in (qualname.split(".") if qualname else []):
@@ -169,12 +170,46 @@ def _function_runners(maps, state, module, qualname, attr):
     ]
     if len(matches) != 1:
         return None
+    # Runs during an import are not counted: what they produced is state, and
+    # the state diff reports that on its own.
     bits = 0
-    file_bits = 0
     for line in range(matches[0]["low"], matches[0]["high"] + 1):
-        bits |= cov["rt"].get(line, 0) | cov["imf"].get(line, 0)
-        file_bits |= cov["ef"].get(line, 0)
-    return bits | maps.files_to_tests(file_bits)
+        bits |= cov["rt"].get(line, 0)
+    return bits
+
+
+def _entry_readers(maps, job, key, value):
+    """Tests that read an entry of a class-level dict that the patch changed.
+
+    None when the dict cannot be compared entry by entry.
+    """
+    from br import basestate
+
+    if os.environ.get("BR_NO_ENTRIES"):
+        return None  # for checking entry-level selection against attribute-level
+    before = maps.entries().get(key)
+    recorded = maps.key_readers()
+    if before is None or recorded is None or type(value) is not dict:
+        return None
+    after = basestate.dict_entries(value, job.translate)
+    if after is None:
+        return None
+    bits = recorded["all"].get(key, 0)
+    by_key = recorded["key"].get(key, {})
+    for fingerprint, item in before.items():
+        if after.get(fingerprint) != item:  # changed or removed
+            for test_index in by_key.get(fingerprint, ()):
+                bits |= 1 << test_index
+    added = [fingerprint for fingerprint in after if fingerprint not in before]
+    if added:
+        bits |= recorded["miss"].get(key, 0)  # a lookup that used to find nothing
+        for fingerprint in added:
+            # ...or found it in a table built from this one and something else
+            for test_index in by_key.get(fingerprint, ()):
+                bits |= 1 << test_index
+    if len(after) != len(before):
+        bits |= recorded["len"].get(key, 0)
+    return bits
 
 
 def diff_candidates(job, maps, log, everything):
@@ -258,6 +293,10 @@ def diff_candidates(job, maps, log, everything):
                 if key in tracked and (gone or cells.trackable(attr, value)):
                     found = readers.get(key, 0)
                     tracked_key = key
+                    narrowed = _entry_readers(maps, job, key, value)
+                    if narrowed is not None:
+                        # Slices still go by who read the attribute at all.
+                        found &= narrowed
             elif isinstance(owner, type):
                 # A new attribute hides the one its bases provided.
                 for parent in owner.__mro__[1:]:
@@ -386,17 +425,36 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             f"(est {estimate:.1f}s), keep {len(keep)}, drop on evidence {len(dropped)}"
         )
         limits = {}
+        cut = 0
         for i in to_verify:
             name = policy.tests[i]
             if i in slices:
                 runner.SLICE[name] = slices[i][:3]
-            limits[name] = 3.0 + 4.0 * (slices[i][3] if i in slices else policy.cpu[i])
+            part = slices.get(("s", i))
+            if part is not None:
+                record = maps.stmts(i)
+                if record is not None:
+                    runner.STMT[name] = (record, part[0])
+                    cut += 1
+            limits[name] = 3.0 + 4.0 * slice_cost(slices, i, policy.cpu[i])
+        if cut:
+            log(f"{cut} tests cut down to the statements that reach the change")
 
         test_ids = [policy.tests[i] for i in to_verify]
         if any(name.startswith(HEAVY) for name in test_ids):
             runner.limit_duckdb_threads()
         index_of = dict(zip(test_ids, to_verify))
-        state = {"stop": False}
+        # After a first failure a worker is needed anyway, and checking only pays
+        # for tests that cost far less to run here than to schedule.
+        state = {
+            "stop": False,
+            "keep_going": {
+                policy.tests[i]
+                for i in to_verify
+                if slice_cost(slices, i, policy.cpu[i])
+                <= max(0.01, CONTINUE_RATIO * policy.ms[policy.to_number[i]] / 1000)
+            },
+        }
 
         def report(test_id, status):
             os.write(write_fd, f"{status} {index_of[test_id]}\n".encode())
@@ -417,7 +475,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 name = policy.tests[i]
                 if name not in timings:
                     continue
-                guess = slices[i][3] if i in slices else policy.cpu[i]
+                guess = slice_cost(slices, i, policy.cpu[i])
                 rows.append((timings[name], guess, policy.ms[policy.to_number[i]] / 1000, name))
             rows.sort(reverse=True)
             total = sum(row[0] for row in rows)

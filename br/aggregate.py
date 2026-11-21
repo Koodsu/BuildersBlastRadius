@@ -31,6 +31,8 @@ def main(argv):
     eager_opens = {}
     cov = {}  # source file -> {"rt": {line: bits}, ...}
     cell_readers = {}
+    key_readers = {}  # cell -> {key fingerprint: [test indexes]}
+    whole_readers = {"miss": {}, "all": {}, "len": {}}  # cell -> tests
     reads_unknown = 0
     sliceable = 0
     unsliceable = []
@@ -116,6 +118,13 @@ def main(argv):
             else:
                 for key in reads:
                     cell_readers[key] = cell_readers.get(key, 0) | bit
+                for cell, found in (data.get("key_reads") or {}).items():
+                    target = key_readers.setdefault(cell, {})
+                    for fingerprint in found:
+                        target.setdefault(fingerprint, []).append(test_index)
+                for kind in ("miss", "all", "len"):
+                    for cell in data.get(kind + "_reads") or ():
+                        whole_readers[kind][cell] = whole_readers[kind].get(cell, 0) | bit
 
     cov_dir = os.path.join(out_dir, "cov")
     os.makedirs(cov_dir, exist_ok=True)
@@ -159,6 +168,18 @@ def main(argv):
     }
     with open(os.path.join(out_dir, "cells.pkl"), "wb") as handle:
         pickle.dump(cell_readers, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(os.path.join(out_dir, "keys.pkl"), "wb") as handle:
+        pickle.dump(
+            {
+                "key": {
+                    cell: {fp: tuple(found) for fp, found in by_key.items()}
+                    for cell, by_key in key_readers.items()
+                },
+                **whole_readers,
+            },
+            handle,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
     with open(os.path.join(out_dir, "meta.pkl"), "wb") as handle:
         pickle.dump(meta, handle, protocol=pickle.HIGHEST_PROTOCOL)
 

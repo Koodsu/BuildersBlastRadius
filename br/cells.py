@@ -73,16 +73,197 @@ def rearm():
     TRIGGERED.clear()
 
 
+# Reads of the entries of class-level dicts, which is where most class-level
+# edits land: a test that looks up one entry does not care about the others.
+KEYREADS: dict = {}  # cell key -> fingerprints of the keys looked up and found
+MISSREADS: set = set()  # cells where a key was looked up and not found
+ALLREADS: set = set()  # cells whose whole content was read (iterated, copied, compared)
+LENREADS: set = set()  # cells whose size or truth was read
+QUIET = [0]  # non-zero while a tracked dict is being copied into a tracked copy
+
+# Tables that sqlglot builds lazily from a class-level dict and then reads in its
+# place: (module, builder function, the cache it fills, the attribute it copies).
+# The copy is tracked as if it were the original, entry by entry.
+DERIVED = (("sqlglot.generator", "_build_dispatch", "_DISPATCH_CACHE", "TRANSFORMS"),)
+_WRAPPED: list = []
+
+
+def instrument_derived():
+    for module_name, function_name, cache_name, attribute in DERIVED:
+        module = sys.modules.get(module_name)
+        if module is None or any(entry[0] is module for entry in _WRAPPED):
+            continue
+        original = getattr(module, function_name, None)
+        cache = getattr(module, cache_name, None)
+        if original is None or type(cache) is not dict:
+            continue
+
+        def build(cls, _original=original, _attribute=attribute):
+            QUIET[0] += 1
+            try:
+                table = _original(cls)
+            finally:
+                QUIET[0] -= 1
+            if type(table) is not dict:
+                return table
+            for klass in cls.__mro__:
+                if _attribute in vars(klass):
+                    tracked = TrackedDict(table)
+                    tracked._br = ((klass.__module__, klass.__qualname__, _attribute),)
+                    return tracked
+            return table
+
+        setattr(module, function_name, build)
+        cache.clear()
+        _WRAPPED.append((module, function_name, original, cache))
+
+
+def restore_derived():
+    for module, function_name, original, cache in _WRAPPED:
+        setattr(module, function_name, original)
+        cache.clear()
+    _WRAPPED.clear()
+
+
+def key_fp(key):
+    """Fingerprint of a dict key, the same value Snapshot.fp gives it, or None
+    for keys that are not worth telling apart."""
+    kind = type(key)
+    if kind is str:
+        return hash(("str", key))
+    if isinstance(key, type):
+        return hash(("cls", key.__module__, key.__qualname__))
+    if isinstance(key, enum.Enum):
+        return hash(("enum", kind.__module__, kind.__qualname__, key.name))
+    if kind is int or kind is bool or kind is float or key is None:
+        return hash((kind.__name__, repr(key)))
+    if kind is tuple:
+        parts = tuple(key_fp(item) for item in key)
+        if None in parts:
+            return None
+        return hash(("tuple", parts))
+    return None
+
+
+class TrackedDict(dict):
+    """A class-level dict that notes which of its entries get read.
+
+    Every way of reading a dict's content is overridden: the C fast paths for
+    copying and merging only apply to dicts that keep the built-in iterator.
+    """
+
+    __slots__ = ("_br",)
+
+    def _key(self, key):
+        if PAUSED[0] or QUIET[0]:
+            return
+        fingerprint = key_fp(key)
+        if fingerprint is None:
+            ALLREADS.update(self._br)
+        elif dict.__contains__(self, key):
+            for cell in self._br:
+                found = KEYREADS.get(cell)
+                if found is None:
+                    found = KEYREADS[cell] = set()
+                found.add(fingerprint)
+        else:
+            MISSREADS.update(self._br)
+
+    def _all(self):
+        if not PAUSED[0] and not QUIET[0]:
+            ALLREADS.update(self._br)
+
+    def __getitem__(self, key):
+        self._key(key)
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        self._key(key)
+        return dict.get(self, key, default)
+
+    def __contains__(self, key):
+        self._key(key)
+        return dict.__contains__(self, key)
+
+    def setdefault(self, key, default=None):
+        self._key(key)
+        return dict.setdefault(self, key, default)
+
+    def pop(self, key, *default):
+        self._key(key)
+        return dict.pop(self, key, *default)
+
+    def popitem(self):
+        self._all()
+        return dict.popitem(self)
+
+    def __len__(self):
+        if not PAUSED[0] and not QUIET[0]:
+            LENREADS.update(self._br)
+        return dict.__len__(self)
+
+    def __iter__(self):
+        self._all()
+        return dict.__iter__(self)
+
+    def __reversed__(self):
+        self._all()
+        return dict.__reversed__(self)
+
+    def keys(self):
+        self._all()
+        return dict.keys(self)
+
+    def values(self):
+        self._all()
+        return dict.values(self)
+
+    def items(self):
+        self._all()
+        return dict.items(self)
+
+    def copy(self):
+        self._all()
+        return dict(dict.items(self))
+
+    def __eq__(self, other):
+        self._all()
+        return dict.__eq__(self, other)
+
+    def __ne__(self, other):
+        self._all()
+        return dict.__ne__(self, other)
+
+    __hash__ = None
+
+    def __or__(self, other):
+        self._all()
+        return dict(dict.items(self)) | other
+
+    def __ror__(self, other):
+        self._all()
+        return other | dict(dict.items(self))
+
+    def __repr__(self):
+        self._all()
+        return dict.__repr__(self)
+
+    def __reduce__(self):
+        self._all()
+        return (dict, (dict(dict.items(self)),))
+
+
 class Cell:
     """Stands in for a class attribute until its first run-time read."""
 
-    __slots__ = ("owner", "name", "value", "key")
+    __slots__ = ("owner", "name", "value", "key", "raw")
 
-    def __init__(self, owner, name, value, key):
+    def __init__(self, owner, name, value, key, raw=None):
         self.owner = owner
         self.name = name
-        self.value = value
+        self.value = value  # what readers get: a TrackedDict for a plain dict
         self.key = key
+        self.raw = value if raw is None else raw  # what was there before
 
     def __get__(self, obj, objtype=None):
         if not PAUSED[0]:
@@ -109,7 +290,7 @@ def classes_of(module):
         found.append(klass)
         for value in list(vars(klass).values()):
             if isinstance(value, Cell):
-                value = value.value
+                value = value.raw
             if isinstance(value, type):
                 stack.append(value)
     return found
@@ -121,6 +302,10 @@ def trackable(name, value):
     return not hasattr(type(value), "__get__")
 
 
+_TRACKED: dict = {}  # id of a plain dict -> the TrackedDict that stands in for it
+TRACK_KEYS = [True]
+
+
 def instrument(module):
     for klass in classes_of(module):
         if isinstance(klass, enum.EnumMeta):
@@ -129,7 +314,19 @@ def instrument(module):
             if isinstance(value, Cell) or not trackable(name, value):
                 continue
             key = (module.__name__, klass.__qualname__, name)
-            cell = Cell(klass, name, value, key)
+            shown = value
+            if TRACK_KEYS[0] and type(value) is dict:
+                # One stand-in for each dict, however many attributes share it.
+                held = _TRACKED.get(id(value))
+                if held is None or held[0] is not value:
+                    tracked = TrackedDict(value)
+                    tracked._br = (key,)
+                    _TRACKED[id(value)] = (value, tracked)
+                else:
+                    tracked = held[1]
+                    tracked._br = tracked._br + (key,)
+                shown = tracked
+            cell = Cell(klass, name, shown, key, raw=value)
             try:
                 setattr(klass, name, cell)
             except Exception:  # noqa: BLE001
@@ -144,17 +341,21 @@ def instrument_loaded(prefix="sqlglot"):
         if name == prefix or name.startswith(prefix + "."):
             _INSTRUMENTED.add(name)
             instrument(module)
+    if TRACK_KEYS[0]:
+        instrument_derived()
 
 
 def restore_all():
     for cell in _CELLS:
         try:
-            if vars(cell.owner).get(cell.name) is cell:
-                setattr(cell.owner, cell.name, cell.value)
+            current = vars(cell.owner).get(cell.name)
+            if current is cell or current is cell.value:
+                setattr(cell.owner, cell.name, cell.raw)
         except Exception:  # noqa: BLE001
             pass
     _CELLS.clear()
     TRIGGERED.clear()
+    restore_derived()
 
 
 # ---------------------------------------------------------------- fingerprints
@@ -272,7 +473,9 @@ class Snapshot:
         if kind is types.MappingProxyType:
             return hash(("d", frozenset((fp(k), fp(v)) for k, v in value.items())))
         if kind is Cell:
-            return fp(value.value)
+            return fp(value.raw)
+        if kind is TrackedDict:
+            return hash(("d", frozenset((fp(k), fp(v)) for k, v in dict.items(value))))
         module = kind.__module__ or ""
         if module.split(".", 1)[0] in OPAQUE_MODULES:
             self.opaque += 1
@@ -330,7 +533,7 @@ class Snapshot:
                 if only is not None and (name, qualname, attr) not in only:
                     continue
                 if isinstance(value, Cell):
-                    value = value.value
+                    value = value.raw
                 if isinstance(value, enum.Enum) and isinstance(value, klass):
                     out[(name, qualname, attr)] = hash(("member", attr, self.fp(value._value_)))
                 else:

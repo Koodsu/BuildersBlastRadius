@@ -17,7 +17,8 @@ module. Recorded per test:
 - the source lines it executes, split into "at run time" and "while a module
   was being imported";
 - the files it opens;
-- the class attributes it reads (a descriptor records the first read);
+- the class attributes it reads (a descriptor records the first read), and for
+  class-level dicts, which entries it looks up;
 - for tests that hand work to a process pool, the same again per unit of work;
 - how long it takes.
 
@@ -31,7 +32,7 @@ compiled and compared, code object by code object, with the original:
 - a function body changed: the tests that execute the changed statement;
 - class-level or module-level code changed: the patched tree is imported, its
   state is fingerprinted, and the attributes that differ give the tests that
-  read them;
+  read them. For a dict, only the tests that look up an entry that changed;
 - a fixture or other data file changed: the tests that open it.
 
 **Verification** (`br/verify.py`, `br/runner.py`). When running the candidates
@@ -74,7 +75,8 @@ suite.
 | `br/runner.py` | in-process unittest runner, inline process pool |
 | `br/policy.py` | worker packing, verify-or-schedule arithmetic |
 | `br/cells.py`, `br/pyindex.py`, `br/patch.py` | fingerprints, code structure, diff parsing |
-| `br/tracer.py`, `br/aggregate.py`, `br/timing.py`, `br/fixtures.py`, `br/basestate.py`, `br/reindex.py` | build the maps |
+| `br/tracer.py`, `br/aggregate.py`, `br/timing.py`, `br/fixtures.py`, `br/basestate.py` | build the maps |
+| `br/reindex.py`, `br/carry.py` | refresh parts of existing maps without tracing again |
 | `tools/` | development aids (not in the image) |
 
 ## Running

@@ -130,6 +130,20 @@ class Maps:
     def names(self):
         return self._pickle("names.pkl")
 
+    def entries(self):
+        """Per-entry fingerprints of class-level dicts, or {} for older maps."""
+        try:
+            return self._pickle("entries.pkl")
+        except OSError:
+            return {}
+
+    def key_readers(self):
+        """Which tests read which entries of class-level dicts, or None."""
+        try:
+            return self._pickle("keys.pkl")
+        except OSError:
+            return None
+
     def _check_digests(self):
         """Recompute one indexed file's digests: they must match the maps exactly."""
         root = os.environ.get("BR_SG", "/sg")
@@ -158,6 +172,22 @@ class Maps:
             except OSError:
                 self._units[test_index] = None
         return self._units[test_index]
+
+    def stmts(self, test_index):
+        """Statement units of an expensive test (see br/stmts.py), or None."""
+        key = ("stmts", test_index)
+        if key not in self._units:
+            path = os.path.join(self.dir, "stmts", f"{test_index}.pkl")
+            record = None
+            try:
+                with open(path, "rb") as handle:
+                    record = pickle.load(handle)
+                if record.get("id") != self.tests[test_index]:
+                    record = None
+            except (OSError, pickle.PickleError, EOFError, IndexError):
+                record = None
+            self._units[key] = record
+        return self._units[key]
 
     def cov(self, source):
         if source not in self._cov:

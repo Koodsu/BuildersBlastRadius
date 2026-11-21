@@ -267,6 +267,10 @@ def _run_one(test_id, out_path, token_write, with_cells=True):
         IM.clear()
         OPENS.clear()
         cells.READS.clear()
+        cells.KEYREADS.clear()
+        cells.MISSREADS.clear()
+        cells.ALLREADS.clear()
+        cells.LENREADS.clear()
         MON.restart_events()
         marks = {}
         started = time.process_time()
@@ -297,6 +301,10 @@ def _run_one(test_id, out_path, token_write, with_cells=True):
                     "imb": import_bodies,
                     "opens": set(OPENS),
                     "reads": set(cells.READS) if with_cells else None,
+                    "key_reads": {k: set(v) for k, v in cells.KEYREADS.items()},
+                    "miss_reads": set(cells.MISSREADS),
+                    "all_reads": set(cells.ALLREADS),
+                    "len_reads": set(cells.LENREADS),
                     "units": recorder.export() if with_cells else None,
                 },
                 handle,
@@ -496,6 +504,9 @@ def main(argv):
     os.write(token_write, b"x" * jobs)
 
     files = _test_files(SG)
+    only = os.environ.get("BR_ONLY")
+    if only:
+        files = [name for name in files if any(part in name for part in only.split(","))]
     zygotes = {}
     for rel_path in files:
         pid = os.fork()

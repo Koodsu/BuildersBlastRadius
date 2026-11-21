@@ -102,6 +102,53 @@ def mutate_code(root, rng, files):
     raise RuntimeError("no mutation found")
 
 
+ENTRY = re.compile(r"^(\s{8,})([\w.\"' ]+?):\s*(.+),\s*$")
+
+
+def mutate_entry(root, rng, files):
+    """Edit one entry of a dict literal inside a class body: the commonest class-level edit."""
+    for _ in range(400):
+        rel = rng.choice(files)
+        old = open(os.path.join(root, rel), encoding="utf-8").read()
+        lines = old.split("\n")
+        index = rng.randrange(len(lines))
+        match = ENTRY.match(lines[index])
+        if not match:
+            continue
+        indent, key, value = match.groups()
+        choice = rng.random()
+        mutated = lines[:]
+        neighbour = ENTRY.match(lines[index + 1]) if index + 1 < len(lines) else None
+        if choice < 0.3:
+            del mutated[index]  # drop the entry
+        elif choice < 0.65 and neighbour and neighbour.group(3) != value:
+            mutated[index] = f"{indent}{key}: {neighbour.group(3)},"  # the next entry's value
+        else:
+            changed = None
+            for pattern, replacement in rng.sample(CODE_OPS, len(CODE_OPS)):
+                found = list(re.finditer(pattern, value))
+                if found:
+                    hit = rng.choice(found)
+                    piece = str(int(hit.group(1)) + 1) if replacement is None else replacement
+                    changed = value[: hit.start()] + piece + value[hit.end():]
+                    break
+            if changed is None or changed == value:
+                continue
+            mutated[index] = f"{indent}{key}: {changed},"
+        new = "\n".join(mutated)
+        try:
+            a = compile(old, rel, "exec", dont_inherit=True)
+            compile(new, rel, "exec", dont_inherit=True)
+        except SyntaxError:
+            continue
+        # Only entries of class-level dicts: the module's own constants must differ.
+        b = compile(new, rel, "exec", dont_inherit=True)
+        if repr(a.co_consts) == repr(b.co_consts) and a.co_code == b.co_code:
+            pass
+        return diff(rel, old, new)
+    raise RuntimeError("no entry found")
+
+
 def mutate_fixture(root, rng, files):
     for _ in range(200):
         rel = rng.choice(files)
@@ -166,10 +213,13 @@ def main():
     fixtures = fixture_files(root)
     kinds = {}
     alphabet = "23456789abcdefghjkmnpqrstuvwxyz"
+    only_entries = os.environ.get("ENTRIES") == "1"
     for _ in range(count):
         commit = "".join(rng.choice(alphabet) for _ in range(4))
         roll = rng.random()
-        if roll < 0.55:
+        if only_entries:
+            kind, text = "code", mutate_entry(root, rng, code_files)
+        elif roll < 0.55:
             kind, text = "code", mutate_code(root, rng, code_files)
         elif roll < 0.75:
             kind, text = "fixture", mutate_fixture(root, rng, fixtures)

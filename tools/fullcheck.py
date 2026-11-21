@@ -26,7 +26,7 @@ from br import patch as patchlib  # noqa: E402
 from br import runner, verify  # noqa: E402
 
 
-def label(set_dir, commit, tests, write_fd):
+def label(set_dir, commit, tests, write_fd, only=None):
     text = open(os.path.join(set_dir, "commits", commit + ".patch"), encoding="utf-8").read()
     patched = {}
     for file_patch in patchlib.parse(text):
@@ -42,6 +42,8 @@ def label(set_dir, commit, tests, write_fd):
     runner.install_inline_pools()
     runner.limit_duckdb_threads()
     ids = [test["id"] for test in tests if test["id"] not in SKIP]
+    if only is not None:
+        ids = [test_id for test_id in ids if test_id in only]
     number = {test["id"]: test["number"] for test in tests}
     limits = {test["id"]: 20.0 + 20 * test["seconds"] for test in tests}
     failed, timed_out, errors = runner.run(ids, limits=limits)
@@ -77,6 +79,23 @@ def main():
 
     todo = [c for c in sorted(kinds) if c not in answers and (not kinds_wanted or kinds[c] in kinds_wanted)]
     running = {}
+    # COARSE=<maps dir>: run only the tests that import or run anything in a patched
+    # file. A superset of what the patch can break, and much less than the suite.
+    coarse_maps = None
+    if os.environ.get("COARSE"):
+        from br import analyze
+
+        coarse_maps = analyze.Maps(os.environ["COARSE"])
+
+    def coarse(commit):
+        if coarse_maps is None:
+            return None
+        text = open(os.path.join(set_dir, "commits", commit + ".patch"), encoding="utf-8").read()
+        bits = 0
+        for file_patch in patchlib.parse(text):
+            bits |= analyze.users_of(coarse_maps, file_patch.path)
+            bits |= coarse_maps.meta["opens"].get(file_patch.path, 0)
+        return {coarse_maps.tests[i] for i in range(len(coarse_maps.tests)) if bits >> i & 1}
 
     def collect():
         pid, status = os.wait()
@@ -105,12 +124,13 @@ def main():
     for commit in todo:
         while len(running) >= parallel:
             collect()
+        only = coarse(commit)
         read_fd, write_fd = os.pipe()
         pid = os.fork()
         if pid == 0:
             os.close(read_fd)
             try:
-                label(set_dir, commit, tests, write_fd)
+                label(set_dir, commit, tests, write_fd, only)
             finally:
                 os._exit(1)
         os.close(write_fd)

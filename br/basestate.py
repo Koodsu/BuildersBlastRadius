@@ -29,6 +29,19 @@ def canary():
     )
 
 
+def dict_entries(value, translate=None):
+    """{key fingerprint: value fingerprint} for a dict, or None if some key cannot
+    be told apart from others (then the dict is only compared as a whole)."""
+    snap = cells.Snapshot(translate)
+    found = {}
+    for key, item in value.items():
+        fingerprint = cells.key_fp(key)
+        if fingerprint is None or fingerprint in found:
+            return None
+        found[fingerprint] = snap.fp(item)
+    return found
+
+
 def module_files(root):
     """{module name: (relative path, is_package)} for everything under root/sqlglot."""
     found = {}
@@ -136,8 +149,10 @@ def main(argv):
         loose -= ignored
         for key in ignored:
             del fingerprints[key]
-    # Class attributes whose reads the tracer records (see cells.instrument).
+    # Class attributes whose reads the tracer records (see cells.instrument), and
+    # for the dicts among them a fingerprint of every entry.
     tracked = set()
+    entries = {}
     for name in loaded:
         for klass in cells.classes_of(sys.modules[name]):
             if isinstance(klass, enum.EnumMeta):
@@ -145,6 +160,12 @@ def main(argv):
             for attr, value in vars(klass).items():
                 if cells.trackable(attr, value):
                     tracked.add((name, klass.__qualname__, attr))
+                    if type(value) is dict:
+                        found = dict_entries(value)
+                        if found is not None:
+                            entries[(name, klass.__qualname__, attr)] = found
+    with open(os.path.join(out_dir, "entries.pkl"), "wb") as handle:
+        pickle.dump(entries, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     files = module_files(root)
     known = set(files)

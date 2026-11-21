@@ -273,9 +273,16 @@ def run_jobs(jobs, maps, policy, output):
             bits >> i & 1 for i, test_id in enumerate(maps.tests) if test_id.startswith(POOLED)
         )
 
-    # The optimizer and executor suites need duckdb and pandas. With several jobs
-    # likely to run them, import once here: the servers and every child inherit it.
-    if sum(1 for job in jobs if pooled(job)) >= 2:
+    import concurrent.futures.process  # noqa: F401
+    import unittest  # noqa: F401
+
+    from br import basestate, cells, runner  # noqa: F401
+
+    # The optimizer and executor test modules import duckdb, numpy and pandas, and
+    # few of their tests use them: stand-ins load the real thing on first use.
+    if os.environ.get("BR_LAZY", "1") == "1":
+        runner.install_lazy_heavy()
+    elif sum(1 for job in jobs if pooled(job)) >= 2:
         try:
             import duckdb  # noqa: F401
             import numpy  # noqa: F401
@@ -283,10 +290,6 @@ def run_jobs(jobs, maps, policy, output):
             from pandas.testing import assert_frame_equal  # noqa: F401
         except Exception:  # noqa: BLE001
             pass
-    import concurrent.futures.process  # noqa: F401
-    import unittest  # noqa: F401
-
-    from br import basestate, cells, runner  # noqa: F401
 
     # Servers that have sqlglot imported already (see verify.py).
     servers = {}
