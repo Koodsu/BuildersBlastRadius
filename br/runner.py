@@ -9,9 +9,11 @@ the real spawn workers do (Expr.__reduce__ goes through sqlglot/serde.py).
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import pickle
 import signal
 import time
+import types
 import unittest
 from concurrent.futures import Future
 
@@ -36,6 +38,9 @@ UNIT_LISTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpch": "tpch_sqls",
 }
 UNIT_HOOK = None  # build time: called with ("submit" | "result", unit number)
+# Tests run with only some of their top-level statements (see br/stmts.py):
+# test id -> (the test's statement units, bitset of the units to keep).
+STMT: dict = {}
 _UNITS = {"count": 0, "plan": None, "light": False}
 
 
@@ -116,6 +121,12 @@ def install_inline_pools():
 def limit_duckdb_threads(count=2):
     """duckdb starts a thread per host core for every database; the run has two CPUs
     and a cap on processes."""
+    import sys
+
+    duckdb = sys.modules.get("duckdb")
+    if isinstance(duckdb, _LazyModule):
+        _DUCKDB_THREADS[0] = count  # applied when the real module is loaded
+        return
     try:
         import duckdb
     except Exception:  # noqa: BLE001
@@ -132,6 +143,101 @@ def limit_duckdb_threads(count=2):
 
     connect._br_limited = True
     duckdb.connect = connect
+
+
+# The optimizer and executor test modules import duckdb, numpy and pandas at the
+# top, which costs most of a second, and few of their tests touch them. A stand-in
+# takes each module's place until something reads an attribute of it or imports
+# one of its submodules.
+HEAVY_MODULES = ("numpy", "pandas", "pandas.testing", "duckdb")
+# What has to be real before each of them is: pandas and duckdb reach for
+# numpy's C interface while they load.
+_HEAVY_NEEDS = {
+    "numpy": ("numpy",),
+    "pandas": ("numpy", "pandas", "pandas.testing"),
+    "pandas.testing": ("numpy", "pandas", "pandas.testing"),
+    "duckdb": ("numpy", "duckdb"),
+}
+_DUCKDB_THREADS = [None]
+_LAZY: dict = {}
+_LAZY_LOADED: list = []  # what this process had to load itself
+# Attributes the import system and introspection look for on any module: a
+# stand-in answers these itself instead of loading the real module.
+_OWN_DUNDERS = frozenset(
+    (
+        "__path__", "__spec__", "__loader__", "__file__", "__cached__", "__package__",
+        "__wrapped__", "__all__", "__builtins__", "__getattr__", "__dir__", "__warningregistry__",
+        "__origin__", "__func__", "__self__", "__code__", "__module__", "__qualname__",
+        "__mro_entries__", "__set_name__", "__get__", "__set__", "__delete__",
+    )
+)
+
+
+class _LazyModule(types.ModuleType):
+    def __getattr__(self, name):
+        if name in _OWN_DUNDERS:
+            raise AttributeError(name)
+        value = getattr(load_heavy(self.__name__), name)
+        try:
+            object.__setattr__(self, name, value)
+        except Exception:  # noqa: BLE001
+            pass
+        return value
+
+
+class _LazyFinder:
+    """Importing a submodule of a stand-in loads the real package first."""
+
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        top = name.partition(".")[0]
+        if top in _LAZY and name not in _LAZY:
+            load_heavy(top)
+            import importlib.util
+
+            return importlib.util.find_spec(name)
+        return None
+
+
+def load_heavy(name):
+    """Replace a stand-in, and the ones it depends on, with the real modules."""
+    import sys
+
+    for key in _HEAVY_NEEDS.get(name, (name,)):
+        stand_in = _LAZY.pop(key, None)
+        if stand_in is None:
+            continue
+        if sys.modules.get(key) is stand_in:
+            del sys.modules[key]
+        _LAZY_LOADED.append(key)
+        try:
+            importlib.import_module(key)
+        except Exception:  # noqa: BLE001
+            pass
+        if key == "duckdb" and _DUCKDB_THREADS[0] is not None:
+            limit_duckdb_threads(_DUCKDB_THREADS[0])
+    return importlib.import_module(name)
+
+
+def install_lazy_heavy():
+    """Put stand-ins for the heavy third-party modules into sys.modules."""
+    import sys
+
+    if any(name in sys.modules for name in HEAVY_MODULES):
+        return
+    for name in HEAVY_MODULES:
+        module = _LazyModule(name)
+        module.__path__ = []  # lets `from pandas.testing import ...` resolve the stand-in
+        module.__spec__ = None
+        _LAZY[name] = module
+        sys.modules[name] = module
+
+    def assert_frame_equal(*args, **kwargs):
+        return load_heavy("pandas.testing").assert_frame_equal(*args, **kwargs)
+
+    _LAZY["pandas.testing"].assert_frame_equal = assert_frame_equal
+    _LAZY["pandas"].testing = _LAZY["pandas.testing"]
+    sys.meta_path.insert(0, _LazyFinder)
 
 
 def split_id(test_id: str):
@@ -172,7 +278,9 @@ class Result(unittest.TestResult):
 
     @property
     def shouldStop(self):
-        return bool(self._stop and self._stop.get("stop"))
+        # With a "keep_going" set the suite carries on and skips the tests outside it.
+        stop = self._stop
+        return bool(stop and stop.get("stop") and not stop.get("keep_going"))
 
     @shouldStop.setter
     def shouldStop(self, value):
@@ -221,6 +329,18 @@ class Result(unittest.TestResult):
         _UNITS["plan"] = plan = SLICE.get(test_id)
         _UNITS["light"] = test_id in LIGHT
         self._trimmed = None
+        self._swapped = None
+        cut = STMT.get(test_id)
+        if cut is not None:
+            try:
+                from br import stmts
+
+                function = stmts.target_function(type(test), test._testMethodName)
+                self._swapped = stmts.install(
+                    type(test), test._testMethodName, cut[0], cut[1], function.__code__.co_filename
+                )
+            except Exception:  # noqa: BLE001
+                self._swapped = None  # it runs whole
         attribute = UNIT_LISTS.get(test_id) if plan is not None else None
         if attribute is not None:
             entries = getattr(type(test), attribute, None)
@@ -244,6 +364,10 @@ class Result(unittest.TestResult):
         if test_id is None:
             return
         self.seen.add(test_id)
+        if getattr(self, "_swapped", None) is not None:
+            function, original = self._swapped
+            function.__code__ = original
+            self._swapped = None
         if getattr(self, "_trimmed", None) is not None:
             owner, attribute, entries = self._trimmed
             setattr(owner, attribute, entries)
@@ -269,6 +393,20 @@ class Result(unittest.TestResult):
 
 def _alarm(signum, frame):
     raise TestTimeout()
+
+
+class _Suite(unittest.TestSuite):
+    """A suite that, once something has failed, only runs the tests still worth checking."""
+
+    _cleanup = False
+    _br_stop = None
+
+    def __iter__(self):
+        stop = self._br_stop
+        for case in self._tests:
+            if stop and stop.get("stop") and case._br_id not in stop.get("keep_going", ()):
+                continue
+            yield case
 
 
 _MISSING = object()
@@ -302,7 +440,8 @@ def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None,
     bare:   optional set of test ids known to pass without their class's
             setUpClass. A class whose tests here are all in it skips that setup.
     stop:   optional dict; once stop['stop'] is true no further test starts,
-            and tests that never started are not reported.
+            and tests that never started are not reported. If it holds a set
+            'keep_going', the tests in that set are still run.
     Returns (failed_ids, timed_out_ids, class_errors).
     """
     signal.signal(signal.SIGALRM, _alarm)
@@ -320,7 +459,10 @@ def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None,
 
     for (module_name, class_name), members in groups:
         if stop and stop.get("stop"):
-            break
+            allowed = stop.get("keep_going") or ()
+            members = [member for member in members if member[0] in allowed]
+            if not members:
+                continue
         try:
             module = importlib.import_module(module_name)
             klass = getattr(module, class_name)
@@ -353,7 +495,9 @@ def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None,
         if bare and all(case._br_id in bare for case in cases):
             stripped = _strip_class_fixtures(klass)
         try:
-            unittest.TestSuite(cases).run(result)
+            suite = _Suite(cases)
+            suite._br_stop = stop
+            suite.run(result)
         except TestTimeout:
             pass
         finally:
@@ -367,7 +511,7 @@ def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None,
             units.update(result.units)
         class_errors.extend(result.class_errors)
         if stop and stop.get("stop"):
-            break
+            continue  # what did not run was left out on purpose
         # A class whose setUpClass failed never starts its tests: they all error.
         for case in cases:
             if case._br_id not in result.seen:

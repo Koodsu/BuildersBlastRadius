@@ -29,7 +29,8 @@ check: build
 	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT) > /dev/null && echo "format ok"
 
 # Rebuilds maps.tar.xz from the pinned sqlglot commit: every test is run once,
-# alone, under tracing, then timed untraced. Takes ten minutes or so, and wants
+# alone, under tracing, then timed untraced; expensive tests are then run once
+# more per group of independent statements. Takes a quarter of an hour, and wants
 # a quiet machine: the timings decide when verifying beats scheduling. Build on
 # the machine's own architecture (duckdb misbehaves under amd64 emulation on
 # Apple Silicon); the maps hold only line numbers, hashes and timings, which do
@@ -44,5 +45,9 @@ maps:
 		python -m br.timing --bare-all /sg /repo/work/maps && \
 		python -m br.fixtures /sg /repo/work/maps && \
 		python -m br.basestate /sg /repo/work/maps && \
-		rm -rf /repo/work/maps/parts && \
+		python -m br.stmts /sg /repo/work/maps 4 && \
+		python -m br.heavy /sg /repo/work/maps 2 && \
+		python -m br.setups /sg /repo/work/maps && \
+		python -m br.modinfo /sg /repo/work/maps && \
+		rm -rf /repo/work/maps/parts /repo/work/maps/stmt_parts && \
 		cd /repo/work/maps && python -m tarfile -c /repo/maps.tar.xz ."

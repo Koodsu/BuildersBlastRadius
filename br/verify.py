@@ -35,9 +35,30 @@ import time
 import types
 
 from br import analyze, cells
-from br.policy import plan_slices
+from br.policy import plan_slices, slice_cost
 
 HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")
+CONTINUE_RATIO = float(os.environ.get("BR_CONTINUE", "0.3"))
+
+# Old and new side by side (see br/dual.py). When the edited expression has been
+# evaluated often enough, in enough tests, in every candidate that is cheap to
+# run, and its old and new form never once differed, the candidates that are
+# dear to run are left out: nothing they do can differ either, unless they feed
+# the expression values none of the others did.
+# Development: run every test that was cut down to some of its statements a second
+# time, whole, and log both verdicts.
+STMT_AUDIT = os.environ.get("BR_STMT_AUDIT") == "1"
+DUAL = os.environ.get("BR_DUAL", "1") == "1"
+# Development: "1" runs everything and logs what would be dropped; "2" stops a job
+# once it is clear the rule cannot apply, and otherwise runs what it would drop.
+DUAL_AUDIT = os.environ.get("BR_DUAL_AUDIT") in ("1", "2")
+DUAL_AUDIT_QUICK = os.environ.get("BR_DUAL_AUDIT") == "2"
+DUAL_CHEAP = float(os.environ.get("BR_DUAL_CHEAP", "0.25"))  # seconds: dearer tests can be dropped
+DUAL_MIN_EVALS = int(os.environ.get("BR_DUAL_EVALS", "300"))
+DUAL_MIN_TESTS = int(os.environ.get("BR_DUAL_TESTS", "20"))
+# When scheduling everything looked cheaper than checking: the share of that cost
+# worth spending on the cheap candidates to find out whether the edit changes nothing.
+DUAL_PROBE_SHARE = float(os.environ.get("BR_DUAL_PROBE", "0.12"))
 
 
 def make_tree(base, dest, patched):
@@ -266,10 +287,12 @@ def diff_candidates(job, maps, log, everything):
     # changed whether or not the fingerprints agree.
     seen = set(changed)
     changed += [key for key in job.forced if key not in seen]
+    job.changed_cells = list(changed)
     if not changed:
         if job.unnamed:
             log("class-level change with no visible effect: assuming the worst")
             full |= job.coarse
+            job.changed_cells = None  # unknown
         return bits, full, targets
 
     readers = maps.cell_readers()
@@ -354,10 +377,18 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
         from br import runner
 
         runner.install_inline_pools()
+        inherited = len(runner._LAZY_LOADED)
 
+        dual = None
         if mode == "hot":
             try:
                 apply_hot(job, index)
+                if DUAL and getattr(job, "dual", None) is not None:
+                    from br import dual
+
+                    dual.install()
+                    for function in index.get(job.dual[:3], ()):
+                        function.__code__ = job.dual[3]
             except Exception as error:  # noqa: BLE001
                 log(f"hot swap refused ({error!r}): retrying cold")
                 os.write(write_fd, b"X\n")
@@ -381,6 +412,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 sys.path.insert(0, dest)
             os.chdir(dest)
 
+        tracked_cells = ()
         if job.plan is not None:
             indexes, to_verify, keep, estimate, dropped, slices = job.plan
         else:
@@ -396,6 +428,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                     )
                     bits |= found | found_full
                     full |= found_full
+                    tracked_cells = maps.state()["tracked"]
                 except BaseException as error:  # noqa: BLE001
                     log(f"state diff failed ({error!r}); assuming the worst")
                     bits |= job.coarse
@@ -412,6 +445,18 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 droppable=bits & ~full if job.targets or cell_targets else 0,
                 diffed=diffed,
             )
+        dear = []
+        cheap_count = len(to_verify)
+        if dual is not None:
+            cheap = [i for i in to_verify if slice_cost(slices, i, policy.cpu[i]) <= DUAL_CHEAP]
+            dear = [i for i in to_verify if slice_cost(slices, i, policy.cpu[i]) > DUAL_CHEAP]
+            if DUAL_AUDIT:
+                # Measuring: also run what the plan would have scheduled unrun, bar the giants.
+                extra = [i for i in keep if policy.ms[policy.to_number[i]] < 6000]
+                keep = [i for i in keep if i not in set(extra)]
+                dear += extra
+            to_verify = cheap + dear
+            cheap_count = len(cheap)
         lines = (
             [f"K {i}" for i in keep]
             + [f"E {i}" for i in dropped]
@@ -424,29 +469,145 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             f"(est {estimate:.1f}s), keep {len(keep)}, drop on evidence {len(dropped)}"
         )
         limits = {}
+        cut = 0
         for i in to_verify:
             name = policy.tests[i]
             if i in slices:
                 runner.SLICE[name] = slices[i][:3]
-            limits[name] = 3.0 + 4.0 * (slices[i][3] if i in slices else policy.cpu[i])
+            part = slices.get(("s", i))
+            if part is not None:
+                record = maps.stmts(i)
+                if record is not None:
+                    runner.STMT[name] = (record, part[0])
+                    cut += 1
+            limits[name] = 3.0 + 4.0 * slice_cost(slices, i, policy.cpu[i])
+            if DUAL_AUDIT or STMT_AUDIT:
+                limits[name] = 900.0  # measuring on a busy machine: no false alarms
+        if cut:
+            log(f"{cut} tests cut down to the statements that reach the change")
 
         test_ids = [policy.tests[i] for i in to_verify]
         if any(name.startswith(HEAVY) for name in test_ids):
             runner.limit_duckdb_threads()
         index_of = dict(zip(test_ids, to_verify))
-        state = {"stop": False}
+        # After a first failure a worker is needed anyway, and checking only pays
+        # for tests that cost far less to run here than to schedule.
+        state = {
+            "stop": False,
+            "keep_going": {
+                policy.tests[i]
+                for i in to_verify
+                if slice_cost(slices, i, policy.cpu[i])
+                <= max(0.01, CONTINUE_RATIO * policy.ms[policy.to_number[i]] / 1000)
+            },
+        }
+
+        seen = {"tests": 0, "evals": 0, "differed": 0, "with_evals": 0, "last": (0, 0)}
+
+        def settle():
+            """Every cheap candidate has run: can the dear ones be left out?"""
+            enough = (
+                not state["stop"]
+                and seen["differed"] == 0
+                and seen["evals"] >= DUAL_MIN_EVALS
+                and seen["with_evals"] >= DUAL_MIN_TESTS
+            )
+            log(
+                f"old and new compared {seen['evals']} times in {seen['with_evals']} tests, "
+                f"differed {seen['differed']} times: "
+                f"{'leaving out' if enough else 'still checking'} {len(dear)} dear tests"
+                f"{' and ' + str(len(keep)) + ' unrun ones' if enough and keep else ''}"
+            )
+            if DUAL_AUDIT_QUICK and not enough:
+                state["stop"] = True
+                state["keep_going"] = set()
+            if not enough or DUAL_AUDIT:
+                return
+            os.write(write_fd, "".join(f"Q {i}\n" for i in dear + list(keep)).encode())
+            state["stop"] = True
+            state["keep_going"] = set()
 
         def report(test_id, status):
+            if dual is not None:
+                evals, differed = dual.COUNTS
+                delta = (evals - seen["last"][0], differed - seen["last"][1])
+                seen["last"] = (evals, differed)
+                seen["evals"] += delta[0]
+                seen["differed"] += delta[1]
+                seen["with_evals"] += 1 if delta[0] else 0
+                if DUAL_AUDIT:
+                    i = index_of[test_id]
+                    log(
+                        f"audit {i} {'dear' if i in dear_set else 'cheap'} "
+                        f"{slice_cost(slices, i, policy.cpu[i]):.3f} {delta[0]} {delta[1]} {status}"
+                    )
             os.write(write_fd, f"{status} {index_of[test_id]}\n".encode())
-            if status != "P":
+            verdicts[test_id] = status
+            if status != "P" and not DUAL_AUDIT and not STMT_AUDIT:
                 # One failure settles that a worker is needed; the rest are scheduled.
+                # A second one, or a test that hangs, says the change breaks things
+                # broadly: checking more would only find more of the same.
+                if state["stop"] or status == "T" or getattr(job, "probe", False):
+                    state["keep_going"] = set()
                 state["stop"] = True
+            if DUAL_AUDIT_QUICK and seen["tests"] < cheap_count and (
+                status != "P" or seen["differed"]
+            ):
+                state["stop"] = True  # the rule cannot apply to this job any more
+                state["keep_going"] = set()
+            seen["tests"] += 1
+            if dual is not None and seen["tests"] == cheap_count and (dear or keep):
+                settle()
 
+        dear_set = set(dear)
+        verdicts = {}
+
+        # A test that passes without its class's setUpClass runs without it, but
+        # only while the change cannot reach the setup: a setup that the patch
+        # breaks fails every test of its class, and a test left out unrun is only
+        # known to be unaffected if nothing it does outside its body can differ.
+        # What each setup runs and reads was recorded when the maps were built.
+        needy = set()
+        setups = maps.setups()
+        changed_cells = getattr(job, "changed_cells", None)
+        for key in {policy.tests[i].rsplit("::", 1)[0] for i in to_verify}:
+            if setups is None:
+                needy.add(key)
+                continue
+            if key not in setups:
+                continue  # a class without a setUpClass of its own
+            watched = setups[key]
+            if watched is None or job.no_slice or not job.targets and job.plan is not None:
+                needy.add(key)  # not watched, or not a change to sqlglot's functions
+                continue
+            if job.plan is None or job.diff_modules:
+                # A state diff: skip the setup only if every attribute that
+                # changed is one whose reads are recorded and the setup read none.
+                if changed_cells is None or any(
+                    cell not in tracked_cells or cell in watched["reads"] for cell in changed_cells
+                ):
+                    needy.add(key)
+                    continue
+            for source, targets in job.targets.items():
+                if not targets.isdisjoint(watched["lines"].get(source, ())):
+                    needy.add(key)
+                    break
+        bare = {name for name in policy.bare if name.rsplit("::", 1)[0] not in needy}
         before_run = time.process_time()
         timings = {} if os.environ.get("BR_DEBUG") else None
-        runner.run(
-            test_ids, limits=limits, report=report, stop=state, timings=timings, bare=policy.bare
-        )
+        runner.run(test_ids, limits=limits, report=report, stop=state, timings=timings, bare=bare)
+        if STMT_AUDIT and runner.STMT:
+            cut_ids = [name for name in test_ids if name in runner.STMT and name in verdicts]
+            runner.STMT.clear()
+            whole = {}
+            runner.run(
+                cut_ids,
+                limits={name: 600.0 for name in cut_ids},
+                report=lambda name, status: whole.__setitem__(name, status),
+                bare=bare,
+            )
+            for name in cut_ids:
+                log(f"slice {index_of[name]} {verdicts[name]} {whole.get(name, '?')} {name}")
         os.write(write_fd, b"D\n")
         if timings:
             # Estimated against measured cost, dearest first: for tuning the cost model.
@@ -455,7 +616,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 name = policy.tests[i]
                 if name not in timings:
                     continue
-                guess = slices[i][3] if i in slices else policy.cpu[i]
+                guess = slice_cost(slices, i, policy.cpu[i])
                 rows.append((timings[name], guess, policy.ms[policy.to_number[i]] / 1000, name))
             rows.sort(reverse=True)
             total = sum(row[0] for row in rows)
@@ -469,10 +630,14 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                     f"est {guess:5.2f} rec {recorded:5.2f}"
                 )
         usage = resource.getrusage(resource.RUSAGE_SELF)
+        loaded = [
+            name for name in ("numpy", "duckdb", "pandas") if name in runner._LAZY_LOADED[inherited:]
+        ]
         log(
             f"cpu: setup {before_run - started:.2f}s, tests "
             f"{time.process_time() - before_run:.2f}s, process total "
             f"{usage.ru_utime + usage.ru_stime:.2f}s since fork"
+            f"{'; loaded here: ' + ', '.join(loaded) if loaded else ''}"
         )
     except BaseException as error:  # noqa: BLE001
         log(f"verifier died: {error!r}")

@@ -26,18 +26,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from br import analyze, verify  # noqa: E402
-from br.policy import Policy, pack, plan_slices  # noqa: E402
+from br.policy import Policy, pack, plan_slices, slice_cost  # noqa: E402
 
 DATA = os.environ.get("BR_DATA", "/data")
 MAPS = os.environ.get("BR_MAPS", os.path.join(HERE, "maps"))
 ROOT = os.environ.get("BR_SG", "/sg")
 
-PARALLEL = 2
+PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
+AUDIT = os.environ.get("BR_DUAL_AUDIT") in ("1", "2")  # development: see br/verify.py
 WALL_BUDGET = float(os.environ.get("BR_WALL", "120"))  # stop verifying after this many seconds
 MEMORY_BYTES = 16 << 30  # address space; duckdb reserves far more than it touches
 RSS_LIMIT = 1800 << 20  # resident memory at which a verifier is killed
 PAGE = os.sysconf("SC_PAGE_SIZE")
 START = time.monotonic()
+ANSWERED: list = []  # set once the answers have been written
 OPTIMIZER = "tests/test_optimizer.py"
 POOLED = (OPTIMIZER, "tests/test_executor.py")
 
@@ -64,6 +66,8 @@ class Job:
         self.sure = analysis.sure
         self.hot = analysis.hot
         self.reads_source = analysis.reads_source
+        self.dual = analysis.dual
+        self.probe = False  # only checking whether the edit changes anything at all
         self.plan = None  # decided up front when no state diff is needed
         self.retried = False
         self.read_fd = None
@@ -214,7 +218,7 @@ def main():
         else:
             modes.append("cold")
     # A server only pays for itself with a couple of jobs to share it.
-    if modes.count("hot") < 2:
+    if modes.count("hot") < 2 and not AUDIT:
         modes = [
             ("leaf" if beyond_core(result) else "cold") if mode == "hot" else mode
             for mode, (result, _) in zip(modes, waiting)
@@ -240,6 +244,40 @@ def main():
                 sure=result.sure,
                 droppable=result.cands & ~result.full if result.targets else 0,
             )
+            if AUDIT and result.dual is not None and mode == "hot":
+                # Measuring: run every candidate but the giants, whatever it costs
+                # (and the giants too when asked).
+                giant = 10**9 if os.environ.get("BR_AUDIT_GIANTS") == "1" else 6000
+                to_verify = [i for i in indexes if ms[to_number[i]] < giant]
+                keep = [i for i in indexes if ms[to_number[i]] >= giant]
+                dropped = []
+            if (
+                not to_verify
+                and result.dual is not None
+                and mode == "hot"
+                and verify.DUAL
+                and not unknown
+            ):
+                # Scheduling looked cheaper than checking. But when old and new can
+                # be compared as they run, the cheap candidates alone may show that
+                # the edit changes nothing, and then nothing needs scheduling.
+                cheap = [i for i in indexes if slice_cost(slices, i, policy.cpu[i]) <= verify.DUAL_CHEAP]
+                rest = [i for i in indexes if i not in set(cheap)]
+                spend = sum(slice_cost(slices, i, policy.cpu[i]) for i in cheap)
+                everything_cost = pack([to_number[i] for i in indexes], ms)[0] / 1000
+                if (
+                    rest
+                    and len(cheap) >= verify.DUAL_MIN_TESTS
+                    and spend <= max(0.5, verify.DUAL_PROBE_SHARE * everything_cost)
+                ):
+                    cheap.sort(
+                        key=lambda i: (
+                            maps.tests[i].rsplit("::", 1)[0],
+                            slice_cost(slices, i, policy.cpu[i]),
+                        )
+                    )
+                    to_verify, keep, estimate, dropped = cheap, rest, spend, []
+                    job.probe = True
             if not to_verify:
                 numbers = [to_number[i] for i in indexes] + unknown
                 cost, workers = pack(numbers, ms)
@@ -252,10 +290,23 @@ def main():
 
     log(f"analysis done: {time.process_time():.2f}s cpu")
     if jobs:
-        run_jobs(jobs, maps, policy, output)
+        try:
+            run_jobs(jobs, maps, policy, output)
+        except Exception as error:  # noqa: BLE001
+            # Whatever went wrong, every commit still gets an answer.
+            log("verification broke down:", repr(error))
+        for job in jobs:
+            if job.commit not in output:
+                numbers = [to_number[i] for i in policy.indexes(job.cands | job.coarse)] + unknown
+                output[job.commit] = pack(sorted(set(numbers)), ms)[1]
+                log(job.commit, f"scheduled {len(numbers)} unverified after the breakdown")
 
-    for commit in commits:
-        print(json.dumps({"commit": commit, "workers": output[commit]}, separators=(",", ":")))
+    lines = [
+        json.dumps({"commit": commit, "workers": output.get(commit, everything)}, separators=(",", ":"))
+        for commit in commits
+    ]
+    ANSWERED.append(True)
+    sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
     sys.stdout.flush()
     log(f"done in {time.monotonic() - START:.1f}s wall, {time.process_time():.2f}s own cpu")
 
@@ -273,9 +324,66 @@ def run_jobs(jobs, maps, policy, output):
             bits >> i & 1 for i, test_id in enumerate(maps.tests) if test_id.startswith(POOLED)
         )
 
-    # The optimizer and executor suites need duckdb and pandas. With several jobs
-    # likely to run them, import once here: the servers and every child inherit it.
-    if sum(1 for job in jobs if pooled(job)) >= 2:
+    import concurrent.futures.process  # noqa: F401
+    import unittest  # noqa: F401
+
+    from br import basestate, cells, runner  # noqa: F401
+
+    # Maps that every state-diff job reads: with two or more such jobs they are
+    # loaded once here instead of once in each verifier.
+    if sum(1 for job in jobs if job.plan is None) >= 2:
+        try:
+            maps.cell_readers()
+            maps.entries()
+            maps.key_readers()
+            maps.setups()
+        except Exception as error:  # noqa: BLE001
+            log("could not load the state maps ahead of time:", repr(error))
+
+    # The optimizer and executor test modules import duckdb, numpy and pandas, and
+    # few of their tests use them: stand-ins load the real thing on first use.
+    heavy = maps.heavy()
+    if os.environ.get("BR_LAZY", "1") == "1" and heavy is not None:
+        runner.install_lazy_heavy()
+        # A module that two or more jobs will load is loaded once, here.
+        index_of = {test_id: i for i, test_id in enumerate(maps.tests)}
+        wanted = {}
+        for test_id, names in heavy["tests"].items():
+            i = index_of.get(test_id)
+            if i is not None:
+                for name in names:
+                    wanted[name] = wanted.get(name, 0) | 1 << i
+        unknown_bits = 0  # tests of those files the map does not know: assume everything
+        for i, test_id in enumerate(maps.tests):
+            if test_id.split("::", 1)[0] in heavy["files"] and test_id not in heavy["tests"]:
+                unknown_bits |= 1 << i
+        for name in ("numpy", "duckdb", "pandas"):
+            users = 0
+            for job in jobs:
+                if job.plan is not None:
+                    likely = job.plan[1]
+                    if job.dual is not None and verify.DUAL:
+                        # The dear ones are mostly left out unrun.
+                        likely = [
+                            i
+                            for i in likely
+                            if slice_cost(job.plan[5], i, policy.cpu[i]) <= verify.DUAL_CHEAP
+                        ]
+                    bits = sum(1 << i for i in likely)
+                else:
+                    bits = job.cands | job.coarse
+                if bits & (wanted.get(name, 0) | unknown_bits):
+                    users += 1
+            # Candidates are a guess at what will run: a job that could use pandas
+            # ends up loading it about one time in four, duckdb most of the time.
+            needed = 4 if name == "pandas" else 2
+            if users >= needed * int(os.environ.get("BR_PRELOAD", "1")):
+                try:
+                    runner.load_heavy(name)
+                    log(f"{name} loaded here for {users} jobs")
+                except Exception as error:  # noqa: BLE001
+                    log(f"{name} would not load: {error!r}")
+    elif sum(1 for job in jobs if pooled(job)) >= 2:
         try:
             import duckdb  # noqa: F401
             import numpy  # noqa: F401
@@ -283,10 +391,6 @@ def run_jobs(jobs, maps, policy, output):
             from pandas.testing import assert_frame_equal  # noqa: F401
         except Exception:  # noqa: BLE001
             pass
-    import concurrent.futures.process  # noqa: F401
-    import unittest  # noqa: F401
-
-    from br import basestate, cells, runner  # noqa: F401
 
     # Servers that have sqlglot imported already (see verify.py).
     servers = {}
@@ -332,22 +436,32 @@ def run_jobs(jobs, maps, policy, output):
         if test_id.startswith(OPTIMIZER) and to_number[i] is not None
     ]
 
+    poller = select.poll()
+
     def finish(job):
         if not job.announced:
             # The verifier never said what it found: assume every possible candidate.
             numbers = [to_number[i] for i in policy.indexes(job.cands | job.coarse)]
             note = "NO ANSWER"
         else:
-            numbers = [to_number[i] for i in job.keep]
-            unsettled = [i for i in job.verify if job.states.get(i) != "P"]
-            numbers += [to_number[i] for i in unsettled]
+            # "Q": left out because old and new never differed in anything that ran.
+            unsettled = [i for i in job.verify if job.states.get(i) not in ("P", "Q")]
+            clean = job.done and not unsettled
+            spared = [i for i, state in job.states.items() if state == "Q"]
+            numbers = [to_number[i] for i in unsettled]
+            numbers += [to_number[i] for i in job.keep if not (clean and job.states.get(i) == "Q")]
             timed_out = any(state == "T" for state in job.states.values())
             note = ""
+            if spared:
+                if clean:
+                    note = f"left out {len(spared)} that cannot differ "
+                else:
+                    numbers += [to_number[i] for i in spared]
             if job.evidence:
-                if unsettled or not job.done:
+                if not clean:
                     numbers += [to_number[i] for i in job.evidence]
                 else:
-                    note = f"dropped {len(job.evidence)} on evidence"
+                    note += f"dropped {len(job.evidence)} on evidence"
             if timed_out or not job.done:
                 note = "TIMEOUT" if timed_out else "INCOMPLETE"
                 # A hang or a dead verifier in the optimizer suite stalls its shared pool.
@@ -390,8 +504,9 @@ def run_jobs(jobs, maps, policy, output):
             job.pid = pid
             job.own_child = True
             job.read_fd = read_fd
-        job.deadline = time.monotonic() + 45.0
+        job.deadline = time.monotonic() + (3600.0 if AUDIT else 45.0)
         running[job.read_fd] = job
+        poller.register(job.read_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
 
     def reap(job, kill=False):
         if kill and job.pid:
@@ -399,6 +514,10 @@ def run_jobs(jobs, maps, policy, output):
                 os.kill(job.pid, signal.SIGKILL)
             except OSError:
                 pass
+        try:
+            poller.unregister(job.read_fd)
+        except (KeyError, OSError, ValueError):
+            pass
         try:
             os.close(job.read_fd)
         except OSError:
@@ -447,10 +566,12 @@ def run_jobs(jobs, maps, policy, output):
             break
         if not running:
             continue
-        ready, _, _ = select.select(list(running), [], [], 0.25)
+        ready = [fd for fd, _ in poller.poll(250)]  # poll: no limit on descriptor numbers
         now = time.monotonic()
         for fd in ready:
-            job = running[fd]
+            job = running.get(fd)
+            if job is None:
+                continue
             try:
                 chunk = os.read(fd, 65536)
             except OSError:
@@ -468,7 +589,7 @@ def run_jobs(jobs, maps, policy, output):
                 elif line == b"A":
                     job.announced = True
                     estimate = sum(policy.cpu[i] for i in job.verify)
-                    job.deadline = now + 30.0 + 6.0 * estimate
+                    job.deadline = now + (3600.0 if AUDIT else 30.0 + 6.0 * estimate)
                 else:
                     kind, _, value = line.partition(b" ")
                     number = int(value)
@@ -511,5 +632,22 @@ def run_jobs(jobs, maps, policy, output):
             pass
 
 
+def last_resort():
+    """Something unforeseen broke before any answer was printed: run everything."""
+    with open(os.path.join(DATA, "tests.json"), encoding="utf-8") as handle:
+        tests = json.load(handle)["tests"]
+    ms = {test["number"]: int(test["seconds"] * 1000 + 0.5) for test in tests}
+    everything = pack(sorted(ms), ms)[1]
+    for name in sorted(os.listdir(os.path.join(DATA, "commits"))):
+        if name.endswith(".patch"):
+            print(json.dumps({"commit": name[:-6], "workers": everything}, separators=(",", ":")))
+    sys.stdout.flush()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:  # noqa: BLE001
+        log("selector broke down:", repr(error))
+        if not ANSWERED:
+            last_resort()

@@ -173,6 +173,43 @@ class Maps:
                 self._units[test_index] = None
         return self._units[test_index]
 
+    def heavy(self):
+        """Which tests load duckdb, numpy or pandas (see br/heavy.py), or None."""
+        try:
+            return self._pickle("heavy.pkl")
+        except (OSError, pickle.PickleError, EOFError):
+            return None
+
+    def modinfo(self):
+        """Per source file: imported names and __future__ flags (see br/modinfo.py)."""
+        try:
+            return self._pickle("modinfo.pkl")
+        except (OSError, pickle.PickleError, EOFError):
+            return {}
+
+    def setups(self):
+        """Lines each test class's setUpClass runs (see br/setups.py), or None."""
+        try:
+            return self._pickle("setups.pkl")
+        except (OSError, pickle.PickleError, EOFError):
+            return None
+
+    def stmts(self, test_index):
+        """Statement units of an expensive test (see br/stmts.py), or None."""
+        key = ("stmts", test_index)
+        if key not in self._units:
+            path = os.path.join(self.dir, "stmts", f"{test_index}.pkl")
+            record = None
+            try:
+                with open(path, "rb") as handle:
+                    record = pickle.load(handle)
+                if record.get("id") != self.tests[test_index]:
+                    record = None
+            except (OSError, pickle.PickleError, EOFError, IndexError):
+                record = None
+            self._units[key] = record
+        return self._units[key]
+
     def cov(self, source):
         if source not in self._cov:
             path = os.path.join(self.dir, "cov", source.replace("/", "__") + ".pkl")
@@ -234,6 +271,10 @@ class Analysis:
         self.reads_source = False  # a candidate opens a patched .py file as data
         self.forced = set()  # cells assigned by the edited class-level statements
         self.unnamed = False  # a class-level edit whose target could not be named
+        # (file, first line, name, code): the one edited function, built to evaluate
+        # the expression as it was next to the expression as it is (see br/dual.py).
+        self.dual = None
+        self.functions_changed = 0
 
     def note(self, text):
         self.notes.append(text)
@@ -300,6 +341,127 @@ def _span_for(spans, starts, line):
     return None
 
 
+FAST = os.environ.get("BR_FAST", "1") == "1"
+
+
+def _extent(base_lines, info, spans, starts):
+    """(line of the `def`, last line) of a function, from the statement index."""
+    header = _span_for(spans, starts, info["first"])
+    if header is None or not header[2]:
+        return None
+    def_line = None
+    for line in range(header[0], header[1] + 1):
+        text = base_lines[line - 1].lstrip()
+        if text.startswith(("def ", "async def ")):
+            def_line = line
+            break
+    if def_line is None:
+        return None
+    last = _span_for(spans, starts, info["high"])
+    end_line = max(info["high"], last[1] if last is not None else info["high"])
+    return def_line, end_line, header[1]
+
+
+def _one_function(maps, root, source, base_text, new_text, hunks, base_tree, spans, starts):
+    """When every hunk replaces lines inside the body of one function, compile
+    just that function instead of the whole file.
+
+    Returns (path of the function, {path below it: (digest, code)}), or None
+    when the full compile is needed. The function as it was is compiled the
+    same way first: it has to come out as the maps recorded it.
+    """
+    from br import dual
+
+    known = maps.modinfo().get(source)
+    if not known:
+        return None
+    touched = []
+    for removed_lines, _, _, simple, _ in hunks:
+        if not simple:
+            return None
+        touched.extend(removed_lines)
+    if not touched:
+        return None
+    low, high = min(touched), max(touched)
+    inside = None
+    for path, info in base_tree.items():
+        if not path or info["kind"] != "function" or path[-1][0].startswith("<"):
+            continue
+        if info["low"] <= low and high <= info["high"]:
+            if all(base_tree[path[:depth]]["kind"] == "class" for depth in range(1, len(path))):
+                inside = path
+                break
+    if inside is None:
+        return None
+    info = base_tree[inside]
+    base_lines = base_text.split("\n")
+    new_lines = new_text.split("\n")
+    if len(base_lines) != len(new_lines):
+        return None
+    extent = _extent(base_lines, info, spans, starts)
+    if extent is None or low <= extent[2]:
+        return None  # the signature is evaluated by the code around the function
+    def_line, end_line, _ = extent
+    if base_lines[: def_line - 1] != new_lines[: def_line - 1] or base_lines[end_line:] != new_lines[end_line:]:
+        return None
+    owner = inside[-2][0] if len(inside) >= 2 else None
+    filename = os.path.join(root, source)
+    codes = []
+    for lines in (base_lines, new_lines):
+        code = dual.compile_alone(
+            lines, def_line, end_line, inside[-1][0], filename, owner, known["imports"], known["future"]
+        )
+        if code is None:
+            return None
+        codes.append(dual.subtree(code))
+    before, after = codes
+    recorded = {
+        path[len(inside) :]: entry["digest"]
+        for path, entry in base_tree.items()
+        if path[: len(inside)] == inside
+    }
+    if {rel: digest for rel, (digest, _) in before.items()} != recorded:
+        return None
+    if set(after) != set(before):
+        return None  # nested code appeared or went: the full compile sorts that out
+    if after[()][1].co_freevars != before[()][1].co_freevars:
+        return None  # e.g. a first super(): the class body around it changes too
+    return inside, after
+
+
+def _dual_code(maps, root, source, base_text, new_text, info, path, spans, starts, new_codes):
+    """The edited function with old and new evaluated side by side, or None."""
+    from br import dual
+
+    name = path[-1][0]
+    if name.startswith("<") or path not in new_codes:
+        return None
+    base_lines = base_text.split("\n")
+    new_lines = new_text.split("\n")
+    if len(base_lines) != len(new_lines):
+        return None
+    extent = _extent(base_lines, info, spans, starts)
+    if extent is None:
+        return None
+    def_line, end_line, _ = extent
+    owner = path[-2][0] if len(path) >= 2 else None
+    code = dual.build(
+        base_lines,
+        new_lines,
+        def_line,
+        end_line,
+        name,
+        os.path.join(root, source),
+        new_codes[path],
+        owner,
+        (maps.modinfo().get(source) or {}).get("imports")
+        or (dual.imported_names(new_codes[()]) if () in new_codes else ()),
+    )
+    if code is None:
+        return None
+    return (os.path.join(root, source), info["first"], name, code)
+
+
 def analyze_python(analysis, maps, source, base_text, new_text, file_patch, root):
     cov = maps.cov(source)
     if cov is None or "index" not in cov:
@@ -310,32 +472,54 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch, root
     spans = cov["index"]["spans"]
     starts = [span[0] for span in spans]
 
-    try:
-        # From bytes, so a coding declaration is honoured the way an import would.
-        new_code = compile(new_text.encode("utf-8"), source, "exec", dont_inherit=True)
-    except (SyntaxError, ValueError, UnicodeError, LookupError):
-        # Nothing that imports this module can work.
-        users = users_of(maps, source)
-        analysis.cands |= users
-        analysis.full |= users
-        analysis.hot_ok = False
-        if source.startswith("sqlglot/"):
-            broken_module = source[:-3].replace("/", ".")
-            if broken_module.endswith(".__init__"):
-                broken_module = broken_module[: -len(".__init__")]
-            analysis.modules.add(broken_module)
-        analysis.python_changed = True
-        analysis.note(f"{source}: does not compile")
-        return
-    new_tree = pyindex.code_tree(new_code)
+    hunks = _hunk_pairs(file_patch)
+    new_codes = {}
+    fast = None
+    if FAST:
+        try:
+            fast = _one_function(
+                maps, root, source, base_text, new_text, hunks, base_tree, spans, starts
+            )
+        except Exception:  # noqa: BLE001
+            fast = None
+    if fast is not None:
+        # Every edited line is inside one function, and that function compiled by
+        # itself: nothing else in the file can have changed.
+        inside, below = fast
+        new_tree = {inside + rel: {"digest": digest} for rel, (digest, _) in below.items()}
+        new_codes = {inside + rel: code for rel, (_, code) in below.items()}
+        changed = [
+            path for path, info in new_tree.items() if info["digest"] != base_tree[path]["digest"]
+        ]
+        added = []
+        removed = []
+    else:
+        try:
+            # From bytes, so a coding declaration is honoured the way an import would.
+            new_code = compile(new_text.encode("utf-8"), source, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError, UnicodeError, LookupError):
+            # Nothing that imports this module can work.
+            users = users_of(maps, source)
+            analysis.cands |= users
+            analysis.full |= users
+            analysis.hot_ok = False
+            if source.startswith("sqlglot/"):
+                broken_module = source[:-3].replace("/", ".")
+                if broken_module.endswith(".__init__"):
+                    broken_module = broken_module[: -len(".__init__")]
+                analysis.modules.add(broken_module)
+            analysis.python_changed = True
+            analysis.note(f"{source}: does not compile")
+            return
+        new_tree = pyindex.code_tree(new_code)
 
-    changed = [
-        path
-        for path, info in base_tree.items()
-        if path in new_tree and new_tree[path]["digest"] != info["digest"]
-    ]
-    added = [path for path in new_tree if path not in base_tree]
-    removed = [path for path in base_tree if path not in new_tree]
+        changed = [
+            path
+            for path, info in base_tree.items()
+            if path in new_tree and new_tree[path]["digest"] != info["digest"]
+        ]
+        added = [path for path in new_tree if path not in base_tree]
+        removed = [path for path in base_tree if path not in new_tree]
     if not changed and not added and not removed:
         analysis.note(f"{source}: same code")
         return
@@ -349,7 +533,6 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch, root
     for tree_path, info in base_tree.items():
         key = (info["first"], tree_path[-1][0] if tree_path else "<module>")
         seen_keys[key] = seen_keys.get(key, 0) + 1
-    new_codes = {}
 
     def collect(node, path):
         new_codes[path] = node
@@ -360,9 +543,9 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch, root
                 counts[const.co_name] = index + 1
                 collect(const, path + ((const.co_name, index),))
 
-    collect(new_code, ())
+    if fast is None:
+        collect(new_code, ())
 
-    hunks = _hunk_pairs(file_patch)
     rt, imf, imb, ef, eb = cov["rt"], cov["imf"], cov["imb"], cov["ef"], cov["eb"]
     in_sqlglot = source.startswith("sqlglot/")
     module_name = source[:-3].replace("/", ".")
@@ -409,6 +592,19 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch, root
                     precise = False
             if not precise:
                 lines = range(low, high + 1)
+            if not maps.meta.get("first_lines"):
+                # Maps traced without function entries cannot see code on the line
+                # a function starts on: do not cut tests down by lines then.
+                edited = {line for removed_lines, _, _, _, _ in hunks for line in removed_lines}
+                if info["first"] in edited or not edited:
+                    analysis.no_slice = True
+            elif path[-1][0] == "<lambda>":
+                # A lambda sits inside a statement, often a table hundreds of lines
+                # long. With function entries on record, the lines that matter are
+                # the lambda's own: who runs the rest of the table does not run it.
+                inner = {line for line in lines if low <= line <= high}
+                if inner:
+                    lines = inner
             bits = _or_lines(rt, lines)
             import_bits = _or_lines(imf, lines)
             eager = _or_lines(ef, lines)
@@ -428,6 +624,18 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch, root
                 analysis.hot.append(
                     (os.path.join(root, source), outer_info["first"], name, new_codes[outer])
                 )
+            analysis.functions_changed += 1
+            if precise and in_sqlglot and all(
+                base_tree[path[:depth]]["kind"] != "function" for depth in range(1, len(path))
+            ):
+                try:
+                    built = _dual_code(
+                        maps, root, source, base_text, new_text, info, path, spans, starts, new_codes
+                    )
+                except Exception:  # noqa: BLE001
+                    built = None
+                if built is not None:
+                    analysis.dual = built
             at_import = import_bits | maps.files_to_tests(eager)
             if at_import:
                 if in_sqlglot:
@@ -580,4 +788,13 @@ def analyze(commit, patch_text, maps, root):
             analysis.note(f"{source}: outside the tree, named by {mentioned.bit_count()} tests")
         else:
             analysis.note(f"{source}: data file")
+    if analysis.dual is not None and (
+        analysis.functions_changed != 1
+        or analysis.diff_modules
+        or len(analysis.hot) != 1
+        or analysis.hot[0][:3] != analysis.dual[:3]
+    ):
+        analysis.dual = None
+    if analysis.dual is not None:
+        analysis.note("old and new can be compared as they run")
     return analysis

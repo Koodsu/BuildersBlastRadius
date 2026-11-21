@@ -39,6 +39,19 @@ PROBE_MIN = 6.0  # only tests recorded at least this long are worth the risk
 PROBE_RISK = float(os.environ.get("BR_PROBE_RISK", "6.0"))  # the risk's price, in seconds
 
 SLICE_MIN = 0.2  # tests cheaper than this run whole
+STMT_MIN = 0.02  # tests cheaper than this are not cut into statement units
+STMTS = os.environ.get("BR_STMTS", "1") == "1"
+
+
+def slice_cost(slices, index, whole):
+    """What a candidate costs to run here, given the slices planned for it."""
+    cost = whole
+    if index in slices:
+        cost = slices[index][3]
+    part = slices.get(("s", index))
+    if part is not None:
+        cost = max(0.0, min(cost, whole - part[2]))
+    return cost
 
 
 def pack(numbers, ms):
@@ -117,7 +130,7 @@ class Policy:
         if not indexes or any(sure >> i & 1 for i in indexes):
             # A worker is needed anyway; the others ride along for less than a check costs.
             return [], indexes, 0.0, []
-        cost = {i: slices[i][3] if i in slices else self.cpu[i] for i in indexes}
+        cost = {i: slice_cost(slices, i, self.cpu[i]) for i in indexes}
         recorded = {i: self.ms[self.to_number[i]] / 1000 for i in indexes}
         everything = self._pack_cost(indexes)
         overhead = 0.0 if diffed else OVERHEAD[mode]
@@ -209,7 +222,10 @@ def plan_slices(maps, policy, indexes, full, targets, cell_targets, no_slice):
     Returns {test index: (mode, units to keep, unit count, estimated cost)}.
     """
     slices = {}
-    if no_slice:
+    if no_slice or cell_targets:
+        # A change to class-level state is not cut by who read it: values built
+        # from it on first use (the generator's dispatch table) are read once per
+        # process, so only the first unit to need them is recorded as a reader.
         return slices
     sliceable = maps.meta.get("sliceable", 0)
     for index in indexes:
@@ -235,4 +251,28 @@ def plan_slices(maps, policy, indexes, full, targets, cell_targets, no_slice):
         part = units["always"] + sum(costs[unit] for unit in range(count) if keep >> unit & 1)
         rate = policy.cpu[index] / whole if whole > 0 else 1.0
         slices[index] = (units["mode"], keep, count, part * rate)
+    if STMTS and targets and not cell_targets:
+        for index in indexes:
+            if full >> index & 1 or policy.cpu[index] < STMT_MIN:
+                continue
+            record = maps.stmts(index)
+            if record is None or record.get("traced", 0) <= 0:
+                continue
+            count = len(record["units"])
+            needed = 0
+            for source, lines in targets.items():
+                by_line = record["lines"].get(source)
+                if by_line:
+                    for line in lines:
+                        needed |= by_line.get(line, 0)
+            if not needed:
+                continue  # nothing explains why it is a candidate: run it whole
+            keep = (needed | record.get("pool", 0)) & ((1 << count) - 1)
+            costs = record["cost"]
+            rate = policy.cpu[index] / record["traced"]
+            saved = sum(costs[unit] for unit in range(count) if not keep >> unit & 1) * rate
+            if saved < 0.004:
+                continue
+            # (the statement units to keep, how many there are, CPU left out)
+            slices[("s", index)] = (keep, count, min(saved, policy.cpu[index] * 0.98))
     return slices

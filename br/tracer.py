@@ -58,6 +58,16 @@ def _on_line(code, line):
     return DISABLE
 
 
+# Python 3.13 reports no LINE event for the line a function starts on, so a
+# function whose whole body is on that line (most lambdas in sqlglot's tables)
+# would never show up as run. Entering a function counts as running its first line.
+FIRST_LINES = True
+
+
+def _on_start(code, offset):
+    return _on_line(code, code.co_firstlineno)
+
+
 def _note_path(path):
     if isinstance(path, bytes):
         try:
@@ -137,7 +147,8 @@ def _install():
     _wrap_opens()
     MON.use_tool_id(TOOL, "blast-radius")
     MON.register_callback(TOOL, MON.events.LINE, _on_line)
-    MON.set_events(TOOL, MON.events.LINE)
+    MON.register_callback(TOOL, MON.events.PY_START, _on_start)
+    MON.set_events(TOOL, MON.events.LINE | MON.events.PY_START)
 
 
 class UnitRecorder:
