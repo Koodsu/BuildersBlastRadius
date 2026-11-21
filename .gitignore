@@ -1,0 +1,5 @@
+work/
+output.jsonl
+.DS_Store
+__pycache__/
+*.pyc
