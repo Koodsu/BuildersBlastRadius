@@ -58,6 +58,12 @@ PREFIX_SHARE = 0.2
 # must be run, not a sample.
 PROBE = os.environ.get("BR_PROBE", "0") == "1"
 PROBE_OTHERS = int(os.environ.get("BR_PROBE_OTHERS", "12"))  # other tests that must pass
+# The same evidence, taken further (off unless BR_PROBE_ALL=1): when every
+# candidate that was cheap enough to check has been checked and has passed, and
+# there were at least PROBE_ALL_OTHERS of them, the candidates that were only
+# going to be scheduled because checking them costs too much are left out too.
+PROBE_ALL = os.environ.get("BR_PROBE_ALL", "0") == "1"
+PROBE_ALL_OTHERS = int(os.environ.get("BR_PROBE_ALL_OTHERS", "12"))
 PROBE_MIN = 6.0  # only tests recorded at least this long are worth the risk
 PROBE_RISK = float(os.environ.get("BR_PROBE_RISK", "6.0"))  # the risk's price, in seconds
 

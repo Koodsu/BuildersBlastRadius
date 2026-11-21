@@ -128,6 +128,17 @@ candidates showed:
   applies. Exact.
 - *Scheduled*: when none applies, or the check would cost more than it can save.
 
+**Evidence taken further** (`BR_PROBE_ALL`, an experiment). The rule above
+leaves a giant out when a dozen other candidates have passed. With
+`BR_PROBE_ALL=1` the same reasoning is applied to every candidate that is only
+scheduled because checking it here costs more than scheduling it, and the
+number of passes asked for is `BR_PROBE_ALL_OTHERS` (`BR_PROBE_OTHERS` for the
+giants). What is known about the risk: over 200 generated edits that
+`test_execute_tpcds` shares with at most 40 other tests, the others all passed
+in 33 and the giant passed in all 33, 14 of them with fewer than a dozen
+others. That says nothing yet about a dear test failing where the cheap ones
+pass; on the labelled sets the rule fired once outside that audit.
+
 **Units of a test are not isolated.** A pooled test is cut down to the units of
 work that reach a change only for edits to function bodies. sqlglot builds
 some tables on first use and keeps them (the generators' dispatch tables), so

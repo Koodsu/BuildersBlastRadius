@@ -44,4 +44,10 @@ ENV BR_PROBE=1 BR_CPU_FACTOR=1.0
 # If they never differ, the candidates that are dear to run are left out.
 # Evidence, not proof. Set it to 0 to check or schedule those as before.
 ENV BR_DUAL=1
+# Experiment: evidence taken further. With BR_PROBE_ALL=1, once every candidate
+# that was cheap enough to check has passed (at least BR_PROBE_ALL_OTHERS of
+# them), the candidates that were only scheduled because checking them costs
+# too much are left out as well; BR_PROBE_OTHERS is the same count for the two
+# giants. Measured on generated edits only: see the README before relying on it.
+ENV BR_PROBE_ALL=1 BR_PROBE_ALL_OTHERS=1 BR_PROBE_OTHERS=1
 CMD ["python", "/app/selector.py"]

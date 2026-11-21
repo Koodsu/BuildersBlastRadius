@@ -40,7 +40,15 @@ import time
 import types
 
 from br import analyze, cells
-from br.policy import CPU_FACTOR, PREFIX_SHARE, PROBE_MIN, plan_slices, slice_cost
+from br.policy import (
+    CPU_FACTOR,
+    PREFIX_SHARE,
+    PROBE_ALL,
+    PROBE_ALL_OTHERS,
+    PROBE_MIN,
+    plan_slices,
+    slice_cost,
+)
 
 HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")
 WALL_END = None  # time.monotonic() at which the selector stops waiting for verifiers
@@ -422,6 +430,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
         tracked_cells = ()
         if job.plan is not None:
             indexes, to_verify, keep, estimate, evidence, late, slices = job.plan
+            droppable = job.cands & ~job.full if job.targets else 0
         else:
             bits = job.cands
             full = job.full
@@ -444,12 +453,13 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             slices = plan_slices(
                 maps, policy, indexes, full, job.targets, cell_targets, job.no_slice
             )
+            droppable = bits & ~full if job.targets or cell_targets else 0
             to_verify, keep, estimate, evidence, late = policy.decide(
                 indexes,
                 mode=mode,
                 slices=slices,
                 sure=job.sure,
-                droppable=bits & ~full if job.targets or cell_targets else 0,
+                droppable=droppable,
                 diffed=diffed,
             )
 
@@ -793,6 +803,33 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             settled[i] = status
             os.write(write_fd, f"{status} {i}\n".encode())
             return status == "P"
+
+        # Evidence taken further (see policy.PROBE_ALL): everything cheap enough to
+        # check was checked and passed, so what was only going to be scheduled for
+        # costing too much to check is left out, the giants with it.
+        if (
+            PROBE_ALL
+            and not measuring
+            and not spared["done"]
+            and counts["F"] == 0
+            and not scouted
+            and counts["P"] >= PROBE_ALL_OTHERS
+            and all(settled.get(i) == "P" for i in to_verify)
+        ):
+            left_out = [
+                i
+                for i in list(keep) + giants
+                if droppable >> i & 1 and not job.sure >> i & 1
+            ]
+            if left_out:
+                os.write(write_fd, "".join(f"Q {i}\n" for i in left_out).encode())
+                log(f"every cheap candidate passed: leaving out {len(left_out)} dear ones")
+                if len(left_out) == len(keep) + len(giants):
+                    spared["done"] = True
+                else:
+                    giants_left = set(left_out)
+                    late = [i for i in late if i not in giants_left]
+                    evidence = [i for i in evidence if i not in giants_left]
 
         # Giants: with nothing failed and enough passed, the ones in `evidence` are
         # left out on that alone. Any other is run here if that is the better bet.
