@@ -14,6 +14,57 @@ from br import pyindex
 PYTEST_CONFIG = {"pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg", "conftest.py", ".pytest.ini", "pytest.toml", ".pytest.toml"}
 
 
+_HELPERS = []
+
+
+def _loads_like_before(root, base_text, new_text):
+    """False if one of the suite's fixture loaders accepts the old text but not the new.
+
+    A fixture that no longer loads takes down every test of a class that loads
+    it in setUpClass, whether or not the test uses it.
+    """
+    if not _HELPERS:
+        try:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "_br_fixture_helpers", os.path.join(root, "tests", "helpers.py")
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _HELPERS.append(module)
+        except Exception:  # noqa: BLE001
+            _HELPERS.append(None)
+    helpers = _HELPERS[0]
+    if helpers is None:
+        return False
+    path = f"/tmp/br_fixture_{os.getpid()}.sql"
+    try:
+        for name in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+            loader = getattr(helpers, name, None)
+            if loader is None:
+                return False
+            outcomes = []
+            for text in (base_text, new_text):
+                with open(path, "w", encoding="utf-8", newline="") as handle:
+                    handle.write(text)
+                try:
+                    list(loader(path))
+                    outcomes.append(True)
+                except Exception:  # noqa: BLE001
+                    outcomes.append(False)
+            if outcomes[0] and not outcomes[1]:
+                return False
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 _PYTEST_SECTION = re.compile(r"^\s*\[(tool\.pytest|tool:pytest|pytest)\b", re.M)
 _TEST_TEXT: dict = {}
 
@@ -60,7 +111,24 @@ class Maps:
             self.file_bits[file_index] |= 1 << test_index
         self._cov = {}
         self._units = {}
+        self._loaded = {}
         self.digests_ok = self._check_digests()
+
+    def _pickle(self, name):
+        if name not in self._loaded:
+            with open(os.path.join(self.dir, name), "rb") as handle:
+                self._loaded[name] = pickle.load(handle)
+        return self._loaded[name]
+
+    def state(self):
+        """Fingerprints of import-time state, the import graph, and friends."""
+        return self._pickle("state.pkl")
+
+    def cell_readers(self):
+        return self._pickle("cells.pkl")
+
+    def names(self):
+        return self._pickle("names.pkl")
 
     def _check_digests(self):
         """Recompute one indexed file's digests: they must match the maps exactly."""
@@ -145,6 +213,11 @@ class Analysis:
         self.full = 0  # candidates for some other reason: they cannot be run in slices
         self.no_slice = False
         self.sure = 0  # candidates expected to fail: not worth checking
+        # Function bodies can be swapped into a process that already imported sqlglot.
+        self.hot = []  # (absolute file, first line, name, new code object)
+        self.hot_ok = True
+        self.modules = set()  # sqlglot modules whose source changed
+        self.reads_source = False  # a candidate opens a patched .py file as data
         self.forced = set()  # cells assigned by the edited class-level statements
         self.unnamed = False  # a class-level edit whose target could not be named
 
@@ -213,7 +286,7 @@ def _span_for(spans, starts, line):
     return None
 
 
-def analyze_python(analysis, maps, source, base_text, new_text, file_patch):
+def analyze_python(analysis, maps, source, base_text, new_text, file_patch, root):
     cov = maps.cov(source)
     if cov is None or "index" not in cov:
         analysis.fallback = True
@@ -231,6 +304,12 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch):
         users = users_of(maps, source)
         analysis.cands |= users
         analysis.full |= users
+        analysis.hot_ok = False
+        if source.startswith("sqlglot/"):
+            broken_module = source[:-3].replace("/", ".")
+            if broken_module.endswith(".__init__"):
+                broken_module = broken_module[: -len(".__init__")]
+            analysis.modules.add(broken_module)
         analysis.python_changed = True
         analysis.note(f"{source}: does not compile")
         return
@@ -247,6 +326,27 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch):
         analysis.note(f"{source}: same code")
         return
     analysis.python_changed = True
+    if not source.startswith("sqlglot/"):
+        analysis.hot_ok = False
+    if added or removed:
+        analysis.hot_ok = False
+    # (first line, name) must pick out one code object for a hot swap to find it.
+    seen_keys = {}
+    for tree_path, info in base_tree.items():
+        key = (info["first"], tree_path[-1][0] if tree_path else "<module>")
+        seen_keys[key] = seen_keys.get(key, 0) + 1
+    new_codes = {}
+
+    def collect(node, path):
+        new_codes[path] = node
+        counts = {}
+        for const in node.co_consts:
+            if hasattr(const, "co_code"):
+                index = counts.get(const.co_name, 0)
+                counts[const.co_name] = index + 1
+                collect(const, path + ((const.co_name, index),))
+
+    collect(new_code, ())
 
     hunks = _hunk_pairs(file_patch)
     rt, imf, imb, ef, eb = cov["rt"], cov["imf"], cov["imb"], cov["ef"], cov["eb"]
@@ -254,6 +354,8 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch):
     module_name = source[:-3].replace("/", ".")
     if module_name.endswith(".__init__"):
         module_name = module_name[: -len(".__init__")]
+    if in_sqlglot:
+        analysis.modules.add(module_name)
     if in_sqlglot and (added or removed):
         analysis.diff_modules.add(module_name)
 
@@ -299,6 +401,19 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch):
             analysis.cands |= bits
             analysis.targets.setdefault(source, set()).update(lines)
             analysis.translate[new_tree[path]["digest"]] = info["digest"]
+            # Every function on the way down to the edited one gets its new code.
+            for depth in range(1, len(path) + 1):
+                outer = path[:depth]
+                outer_info = base_tree[outer]
+                if outer_info["kind"] != "function":
+                    continue
+                name = outer[-1][0]
+                if seen_keys.get((outer_info["first"], name), 0) != 1 or outer not in new_codes:
+                    analysis.hot_ok = False
+                    continue
+                analysis.hot.append(
+                    (os.path.join(root, source), outer_info["first"], name, new_codes[outer])
+                )
             at_import = import_bits | maps.files_to_tests(eager)
             if at_import:
                 if in_sqlglot:
@@ -324,7 +439,9 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch):
                 named = False
                 base_lines = base_text.split("\n")
                 for removed_lines, _, added_texts, _, _ in hunks:
-                    texts = list(added_texts)
+                    # A line on its own names a cell only when it is a whole new
+                    # statement; an edited line is named by the statement it is in.
+                    texts = [] if removed_lines else list(added_texts)
                     for line in removed_lines:
                         if line in own or low <= line <= high:
                             span = _span_for(spans, starts, line)
@@ -362,6 +479,10 @@ def analyze(commit, patch_text, maps, root):
         analysis.note("empty patch")
         return analysis
 
+    tests_python = any(
+        (file_patch.path or "").startswith("tests/") and (file_patch.path or "").endswith(".py")
+        for file_patch in file_patches
+    )
     for file_patch in file_patches:
         source = file_patch.path
         if source is None:
@@ -400,9 +521,21 @@ def analyze(commit, patch_text, maps, root):
         # Whoever reads the file as data sees the new text.
         opened = maps.meta["opens"].get(source, 0)
         opened |= maps.files_to_tests(maps.meta["eager_opens"].get(source, 0))
+        users = maps.meta.get("fixture_users", {}).get(source)
+        if (
+            users is not None
+            and not tests_python
+            and _loads_like_before(root, base_text, new_text)
+        ):
+            # Tests that only see this fixture because their class loads it for
+            # another test do not depend on what it says.
+            analysis.note(f"{source}: {users.bit_count()} of {opened.bit_count()} openers use it")
+            opened = users
         if opened:
             analysis.cands |= opened
             analysis.full |= opened
+            if source.endswith(".py"):
+                analysis.reads_source = True
             if source.startswith("tests/fixtures/"):
                 # A test whose fixture was edited almost always fails.
                 analysis.sure |= opened
@@ -411,12 +544,14 @@ def analyze(commit, patch_text, maps, root):
         name = os.path.basename(source)
         if source.startswith("tests/"):
             analysis.no_slice = True
+        if not (source.endswith(".py") and source.startswith("sqlglot/")):
+            analysis.hot_ok = False
         if source.endswith(".py") and (source.startswith("sqlglot/") or source.startswith("tests/")):
             if name == "conftest.py":
                 analysis.fallback = True
                 analysis.note(f"{source}: pytest config")
                 continue
-            analyze_python(analysis, maps, source, base_text, new_text, file_patch)
+            analyze_python(analysis, maps, source, base_text, new_text, file_patch, root)
         elif name in PYTEST_CONFIG and (
             name in ("pytest.ini", "conftest.py", ".pytest.ini", "pytest.toml", ".pytest.toml")
             or _PYTEST_SECTION.search(new_text)

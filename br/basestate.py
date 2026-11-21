@@ -111,6 +111,12 @@ def main(argv):
     os.chdir(root)
     import unittest  # noqa: F401  (sqlglot checks for it at import)
 
+    # What a bare `import sqlglot` loads: a process that has done only that can
+    # still import a patched version of anything else.
+    import sqlglot  # noqa: F401
+
+    core_modules = sorted(name for name in sys.modules if name.split(".")[0] == "sqlglot")
+
     broken = {}
     loaded = import_all(broken)
     fingerprints, opaque = cells.snapshot(loaded)
@@ -195,6 +201,7 @@ def main(argv):
                 "closure": closure,
                 "module_file": {module: rel for module, (rel, _) in files.items()},
                 "canary": canary(),
+                "core_modules": core_modules,
             },
             handle,
             protocol=pickle.HIGHEST_PROTOCOL,

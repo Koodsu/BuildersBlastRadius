@@ -28,8 +28,15 @@ class SkipUnit(unittest.SkipTest):
 # submit() call. A sliced run executes only the units a change can reach.
 SLICE: dict = {}  # test id -> (mode, keep bitset, expected unit count)
 PROBE: dict = {}  # test id -> seconds: running that long without failing counts as a pass
+LIGHT: set = set()  # test ids probed on a few units: skip the pool's start-up pickling
+# Tests that take their units of work from a list held on the class: in a partial
+# run the entries that are left out are blanked, so they are not even parsed.
+UNIT_LISTS = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds_sqls",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": "tpch_sqls",
+}
 UNIT_HOOK = None  # build time: called with ("submit" | "result", unit number)
-_UNITS = {"count": 0, "plan": None}
+_UNITS = {"count": 0, "plan": None, "light": False}
 
 
 class _UnitFuture(Future):
@@ -51,7 +58,10 @@ class InlineExecutor:
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_):
         if initializer is not None:
-            initializer(*pickle.loads(pickle.dumps(initargs)))
+            if _UNITS["light"]:
+                initializer(*initargs)
+            else:
+                initializer(*pickle.loads(pickle.dumps(initargs)))
 
     def submit(self, fn, /, *args, **kwargs):
         unit = _UNITS["count"]
@@ -208,7 +218,20 @@ class Result(unittest.TestResult):
         test_id = getattr(test, "_br_id", None)
         self._hit = False
         _UNITS["count"] = 0
-        _UNITS["plan"] = SLICE.get(test_id)
+        _UNITS["plan"] = plan = SLICE.get(test_id)
+        _UNITS["light"] = test_id in LIGHT
+        self._trimmed = None
+        attribute = UNIT_LISTS.get(test_id) if plan is not None else None
+        if attribute is not None:
+            entries = getattr(type(test), attribute, None)
+            if isinstance(entries, list) and len(entries) == plan[2]:
+                blank = ({}, "SELECT 1", "")
+                setattr(
+                    type(test),
+                    attribute,
+                    [entry if plan[1] >> unit & 1 else blank for unit, entry in enumerate(entries)],
+                )
+                self._trimmed = (type(test), attribute, entries)
         if self.timings is not None:
             self.timings[test_id] = time.process_time()
         if self.limits and test_id in self.limits:
@@ -221,6 +244,10 @@ class Result(unittest.TestResult):
         if test_id is None:
             return
         self.seen.add(test_id)
+        if getattr(self, "_trimmed", None) is not None:
+            owner, attribute, entries = self._trimmed
+            setattr(owner, attribute, entries)
+            self._trimmed = None
         plan = _UNITS["plan"]
         _UNITS["plan"] = None
         self.units[test_id] = _UNITS["count"]
@@ -244,7 +271,27 @@ def _alarm(signum, frame):
     raise TestTimeout()
 
 
-def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None):
+_MISSING = object()
+
+
+def _strip_class_fixtures(klass):
+    """Make a class's setUpClass and tearDownClass do nothing; returns what to restore."""
+    saved = {}
+    for name in ("setUpClass", "tearDownClass"):
+        saved[name] = klass.__dict__.get(name, _MISSING)
+        setattr(klass, name, classmethod(lambda cls: None))
+    return saved
+
+
+def _restore_class_fixtures(klass, saved):
+    for name, value in saved.items():
+        if value is _MISSING:
+            delattr(klass, name)
+        else:
+            setattr(klass, name, value)
+
+
+def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None, bare=None):
     """Run tests in the given order.
 
     limits: optional {test_id: seconds} wall limit for a test.
@@ -252,6 +299,8 @@ def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None)
             outcome is known. Status is 'P' passed, 'F' failed, 'T' timed out,
             'U' a sliced run that did not go as planned.
     units:  optional dict filled with {test_id: number of units of work it submitted}.
+    bare:   optional set of test ids known to pass without their class's
+            setUpClass. A class whose tests here are all in it skips that setup.
     stop:   optional dict; once stop['stop'] is true no further test starts,
             and tests that never started are not reported.
     Returns (failed_ids, timed_out_ids, class_errors).
@@ -300,12 +349,17 @@ def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None)
         result.report = report
         result.limits = limits
         result.timings = timings
+        stripped = None
+        if bare and all(case._br_id in bare for case in cases):
+            stripped = _strip_class_fixtures(klass)
         try:
             unittest.TestSuite(cases).run(result)
         except TestTimeout:
             pass
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
+            if stripped is not None:
+                _restore_class_fixtures(klass, stripped)
 
         failed |= result.failed | result.unsure
         timed_out |= result.timed_out

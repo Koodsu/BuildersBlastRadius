@@ -29,15 +29,20 @@ check: build
 	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT) > /dev/null && echo "format ok"
 
 # Rebuilds maps.tar.xz from the pinned sqlglot commit: every test is run once,
-# alone, under tracing. Takes a few minutes. Build on the machine's own
-# architecture (duckdb misbehaves under amd64 emulation on Apple Silicon); the
-# maps hold only line numbers, hashes and timings, which do not depend on it.
+# alone, under tracing, then timed untraced. Takes ten minutes or so, and wants
+# a quiet machine: the timings decide when verifying beats scheduling. Build on
+# the machine's own architecture (duckdb misbehaves under amd64 emulation on
+# Apple Silicon); the maps hold only line numbers, hashes and timings, which do
+# not depend on it.
 maps:
 	docker build --target base --tag $(IMAGE)-base .
 	rm -rf $(CURDIR)/work/maps && mkdir -p $(CURDIR)/work/maps
 	docker run --rm --volume $(CURDIR):/repo --env PYTHONPATH=/repo --workdir /sg $(IMAGE)-base sh -c "\
 		python -m br.tracer /sg /repo/work/maps 4 && \
 		python -m br.aggregate /sg /repo/work/maps && \
+		python -m br.timing /sg /repo/work/maps 2 && \
+		python -m br.timing --bare-all /sg /repo/work/maps && \
+		python -m br.fixtures /sg /repo/work/maps && \
 		python -m br.basestate /sg /repo/work/maps && \
 		rm -rf /repo/work/maps/parts && \
 		cd /repo/work/maps && python -m tarfile -c /repo/maps.tar.xz ."

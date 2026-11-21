@@ -35,12 +35,29 @@ compiled and compared, code object by code object, with the original:
 - a fixture or other data file changed: the tests that open it.
 
 **Verification** (`br/verify.py`, `br/runner.py`). When running the candidates
-costs less CPU than scheduling them would cost in simulated time, they are run
-against a view of the tree with the patch applied (symlinks plus the changed
-files, in `/tmp`), and only the ones that fail are scheduled. The run stops at
-the first failure and schedules the rest. Tests that use a process pool are
-run in-process, with arguments and results still pickled the way the pool
-would, and only the units of work the change can reach.
+is expected to cost less CPU than scheduling them would cost in simulated time,
+they are run against the patched code and only the ones that fail are
+scheduled. The run goes cheapest first and stops at the first failure: a worker
+is needed from then on, so the rest are scheduled unverified. A verifier gets
+its patched sqlglot the cheapest way that is safe:
+
+- *hot*: only function bodies changed, and none runs at import time. The new
+  code objects are swapped into a forked copy of a process that has sqlglot and
+  the test modules imported already.
+- *leaf*: the changed modules are ones a bare `import sqlglot` does not load.
+  The verifier is forked from a process that has done just that import and
+  loads the rest from a view of the tree with the patch applied.
+- *cold*: anything else imports the whole patched tree.
+
+Tests that use a process pool are run in-process, with arguments and results
+still pickled the way the pool would, and only the units of work the change can
+reach. Tests known not to need their class's `setUpClass` run without it.
+
+**Dropping on evidence** (`BR_PROBE` in the `Dockerfile`). Two tests are too
+expensive to verify (about 21 s and 29 s). With `BR_PROBE=1`, such a test is
+left out when every other test that runs the changed statement has been run and
+has passed. That is evidence, not proof. With `BR_PROBE=0` it is scheduled
+whenever it could be affected.
 
 **When in doubt, run it.** New, deleted, renamed and binary files, pytest
 configuration, a patch that does not apply, a verifier that crashes or hangs:
@@ -57,14 +74,14 @@ suite.
 | `br/runner.py` | in-process unittest runner, inline process pool |
 | `br/policy.py` | worker packing, verify-or-schedule arithmetic |
 | `br/cells.py`, `br/pyindex.py`, `br/patch.py` | fingerprints, code structure, diff parsing |
-| `br/tracer.py`, `br/aggregate.py`, `br/basestate.py` | build the maps |
+| `br/tracer.py`, `br/aggregate.py`, `br/timing.py`, `br/fixtures.py`, `br/basestate.py`, `br/reindex.py` | build the maps |
 | `tools/` | development aids (not in the image) |
 
 ## Running
 
 ```sh
 make sample   # build, run on the 30 sample commits under the scorer's limits, score
-make maps     # rebuild maps.tar.xz from the pinned commit (a few minutes)
+make maps     # rebuild maps.tar.xz from the pinned commit (ten minutes or so)
 ```
 
-`BR_PROBE` in the `Dockerfile` turns probing on or off; see the comment there.
+`BR_PROBE` in the `Dockerfile` turns dropping on evidence on or off.

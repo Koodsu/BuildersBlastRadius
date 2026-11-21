@@ -131,6 +131,15 @@ def mutate_fixture(root, rng, files):
 
 
 def mutate_comment(root, rng, files):
+    for _ in range(50):
+        try:
+            return _mutate_comment(root, rng, files)
+        except (RuntimeError, ValueError):
+            continue
+    raise RuntimeError("no comment spot")
+
+
+def _mutate_comment(root, rng, files):
     rel = rng.choice(files)
     old = open(os.path.join(root, rel), encoding="utf-8").read()
     lines = old.split("\n")

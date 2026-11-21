@@ -2,7 +2,7 @@
 
 For each patch: find the tests that could be affected using maps built from
 the pinned sqlglot commit, then either run those tests against the patched
-tree (when that is cheaper than scheduling them) and report the ones that
+code (when that is cheaper than scheduling them) and report the ones that
 fail, or schedule them all. Anything not understood runs everything.
 """
 
@@ -39,6 +39,7 @@ RSS_LIMIT = 1800 << 20  # resident memory at which a verifier is killed
 PAGE = os.sysconf("SC_PAGE_SIZE")
 START = time.monotonic()
 OPTIMIZER = "tests/test_optimizer.py"
+POOLED = (OPTIMIZER, "tests/test_executor.py")
 
 
 def log(*parts):
@@ -46,12 +47,14 @@ def log(*parts):
 
 
 class Job:
-    def __init__(self, analysis):
+    def __init__(self, analysis, mode):
         self.commit = analysis.commit
+        self.mode = mode
         self.patched = analysis.patched
         self.cands = analysis.cands
         self.coarse = analysis.coarse
         self.diff_modules = analysis.diff_modules
+        self.modules = analysis.modules
         self.translate = analysis.translate
         self.forced = analysis.forced
         self.unnamed = analysis.unnamed
@@ -59,13 +62,24 @@ class Job:
         self.targets = analysis.targets
         self.no_slice = analysis.no_slice
         self.sure = analysis.sure
+        self.hot = analysis.hot
+        self.reads_source = analysis.reads_source
+        self.plan = None  # decided up front when no state diff is needed
+        self.retried = False
+        self.read_fd = None
+        self.write_fd = None
+        self.reset()
+
+    def reset(self):
         self.pid = None
-        self.fd = None
+        self.own_child = False
         self.buffer = b""
         self.keep = []
+        self.evidence = []  # left out if everything that is run passes
         self.verify = []
         self.states = {}
         self.announced = False
+        self.retry = False
         self.done = False
         self.deadline = 0.0
 
@@ -98,25 +112,35 @@ def main():
     unknown = [number for number in all_numbers if number not in known]
     traced = meta.get("cpu_test") or meta["cpu"]
     plain = meta.get("cpu_plain") or [None] * len(traced)
-    cpu = [traced[i] if plain[i] is None else plain[i] for i in range(len(traced))]
-    # The maps were timed on another machine. Tests that do all their work in-process
-    # should cost here what they were recorded at, which gives the exchange rate.
-    ours = theirs = 0.0
+    ours = [traced[i] if plain[i] is None else plain[i] for i in range(len(traced))]
+    # A test that does all its work in-process costs here what it was recorded at.
+    # Tests that hand work to a process pool were recorded with that work spread
+    # over several cores; in-process they cost our own measurement, converted at
+    # the rate the in-process tests give.
+    mine = theirs = 0.0
     for i, test_id in enumerate(maps.tests):
         number = to_number[i]
-        if number is None or test_id.startswith(("tests/test_optimizer.py", "tests/test_executor.py")):
+        if number is None or test_id.startswith(POOLED):
             continue
-        if ms[number] >= 20 and cpu[i] > 0:
-            ours += cpu[i]
+        if ms[number] >= 20 and ours[i] > 0:
+            mine += ours[i]
             theirs += ms[number] / 1000
-    scale = min(5.0, max(0.1, theirs / ours)) if ours > 0 and theirs > 0 else 1.0
-    cpu = [value * scale for value in cpu]
+    scale = min(5.0, max(0.1, theirs / mine)) if mine > 0 and theirs > 0 else 1.0
+    cpu = []
+    for i, test_id in enumerate(maps.tests):
+        number = to_number[i]
+        if number is not None and not test_id.startswith(POOLED):
+            cpu.append(ms[number] / 1000)
+        else:
+            cpu.append(ours[i] * scale)
     setup_cost = {key: value * scale for key, value in (meta.get("class_setup") or {}).items()}
     order = {test["id"]: position for position, test in enumerate(tests)}
-    policy = Policy(maps.tests, to_number, ms, cpu, setup_cost, order, unknown)
+    policy = Policy(
+        maps.tests, to_number, ms, cpu, setup_cost, order, unknown, bare=meta.get("no_setup", ())
+    )
     log(f"timing scale {scale:.2f}")
 
-    jobs = []
+    waiting = []  # analyses that need a verifier
     for commit in commits:
         try:
             with open(os.path.join(commits_dir, commit + ".patch"), encoding="utf-8") as handle:
@@ -143,35 +167,88 @@ def main():
             log(commit, f"schedule {len(numbers)} (files outside the tree view):", notes)
             output[commit] = pack(numbers, ms)[1]
             continue
+        if not (result.cands | result.coarse) and not unknown:
+            log(commit, "no candidates:", notes)
+            output[commit] = []
+            continue
+        if result.sure and not result.diff_modules:
+            numbers = [to_number[i] for i in policy.indexes(result.cands)] + unknown
+            cost, workers = pack(numbers, ms)
+            log(commit, f"schedule {len(numbers)} ({cost / 1000:.1f}s, sure to fail):", notes)
+            output[commit] = workers
+            continue
+        waiting.append((result, notes))
 
+    # How each remaining commit can get its patched sqlglot (see verify.py).
+    core = set()
+    closure = {}
+    if waiting:
+        try:
+            state = maps.state()
+            core = set(state["core_modules"])
+            closure = state["closure"]
+        except Exception as error:  # noqa: BLE001
+            log("no state map:", repr(error))
+
+    def beyond_core(result):
+        """True if nothing the change can reach is loaded by a bare `import sqlglot`."""
+        touched = set(result.modules) | set(result.diff_modules)
+        if not core or not touched:
+            return False
+        if any(path.startswith("tests/") and path.endswith(".py") for path in result.patched):
+            return False
+        reach = set(touched)
+        for module in touched:
+            reach.update(closure.get(module, [module]))
+        return not (reach & core)
+
+    modes = []
+    for result, notes in waiting:
+        python_only = all(
+            path.startswith("sqlglot/") and path.endswith(".py") for path in result.patched
+        )
+        if result.hot_ok and result.hot and not result.diff_modules and python_only:
+            modes.append("hot")
+        elif beyond_core(result):
+            modes.append("leaf")
+        else:
+            modes.append("cold")
+    # A server only pays for itself with a couple of jobs to share it.
+    if modes.count("hot") < 2:
+        modes = [
+            ("leaf" if beyond_core(result) else "cold") if mode == "hot" else mode
+            for mode, (result, _) in zip(modes, waiting)
+        ]
+    if modes.count("hot") == 0 and modes.count("leaf") < 2:
+        modes = ["cold" if mode == "leaf" else mode for mode in modes]
+    if os.environ.get("BR_MODE") == "cold":
+        modes = ["cold"] * len(modes)  # for checking the quick ways against the sure one
+
+    jobs = []
+    for (result, notes), mode in zip(waiting, modes):
+        commit = result.commit
+        job = Job(result, mode)
         if not result.diff_modules:
             indexes = policy.indexes(result.cands)
-            if not indexes and not unknown:
-                log(commit, "no candidates:", notes)
-                output[commit] = []
-                continue
-            slices, probes = plan_slices(
+            slices = plan_slices(
                 maps, policy, indexes, result.full, result.targets, (), result.no_slice
             )
-            to_verify, keep, estimate, _ = policy.decide(
+            to_verify, keep, estimate, dropped = policy.decide(
                 indexes,
-                extra_cost=0.15,
+                mode=mode,
                 slices=slices,
                 sure=result.sure,
-                probes={i: probe[2] for i, probe in probes.items()},
+                droppable=result.cands & ~result.full if result.targets else 0,
             )
             if not to_verify:
                 numbers = [to_number[i] for i in indexes] + unknown
                 cost, workers = pack(numbers, ms)
-                log(commit, f"schedule {len(numbers)} ({cost / 1000:.1f}s, verify est {estimate:.1f}s):", notes)
+                log(commit, f"schedule {len(numbers)} ({cost / 1000:.1f}s):", notes)
                 output[commit] = workers
                 continue
-        elif not (result.cands | result.coarse) and not unknown:
-            log(commit, "no candidates:", notes)
-            output[commit] = []
-            continue
-        log(commit, "verify:", notes)
-        jobs.append(Job(result))
+            job.plan = (indexes, to_verify, keep, estimate, dropped, slices)
+        log(commit, f"verify ({mode}):", notes)
+        jobs.append(job)
 
     log(f"analysis done: {time.process_time():.2f}s cpu")
     if jobs:
@@ -188,18 +265,17 @@ def run_jobs(jobs, maps, policy, output):
     ms = policy.ms
     unknown = policy.unknown
 
-    # The optimizer and executor suites need duckdb and pandas. With several jobs
-    # likely to run them, import once here instead of once in every child.
-    heavy = 0
-    for job in jobs:
+    def pooled(job):
+        if job.plan is not None:
+            return any(maps.tests[i].startswith(POOLED) for i in job.plan[1])
         bits = job.cands | job.coarse
-        if any(
-            bits >> i & 1
-            for i, test_id in enumerate(maps.tests)
-            if test_id.startswith((OPTIMIZER, "tests/test_executor.py"))
-        ):
-            heavy += 1
-    if heavy >= 2:
+        return any(
+            bits >> i & 1 for i, test_id in enumerate(maps.tests) if test_id.startswith(POOLED)
+        )
+
+    # The optimizer and executor suites need duckdb and pandas. With several jobs
+    # likely to run them, import once here: the servers and every child inherit it.
+    if sum(1 for job in jobs if pooled(job)) >= 2:
         try:
             import duckdb  # noqa: F401
             import numpy  # noqa: F401
@@ -212,8 +288,43 @@ def run_jobs(jobs, maps, policy, output):
 
     from br import basestate, cells, runner  # noqa: F401
 
+    # Servers that have sqlglot imported already (see verify.py).
+    servers = {}
+    server_pid = None
+    served = [job for job in jobs if job.mode in ("hot", "leaf")]
+    if served:
+        test_modules = sorted(
+            {
+                maps.tests[i].split("::", 1)[0][:-3].replace("/", ".")
+                for job in jobs
+                if job.mode == "hot" and job.plan is not None
+                for i in job.plan[1]
+            }
+        )
+        for job in served:
+            job.read_fd, job.write_fd = os.pipe()
+        leaf_read, leaf_write = os.pipe()
+        hot_read, hot_write = os.pipe()
+        server_pid = os.fork()
+        if server_pid == 0:
+            os.close(leaf_write)
+            os.close(hot_write)
+            for job in served:
+                os.close(job.read_fd)
+            verify.core_server(
+                ROOT, jobs, policy, maps, MEMORY_BYTES, leaf_read, hot_read, test_modules
+            )
+            os._exit(0)
+        os.close(leaf_read)
+        os.close(hot_read)
+        for job in served:
+            os.close(job.write_fd)
+            job.write_fd = None
+        servers = {"leaf": leaf_write, "hot": hot_write}
+
     log(f"imports done: {time.process_time():.2f}s cpu")
-    pending = list(jobs)
+    # Jobs that share a server go first, so the servers can exit early.
+    pending = sorted(jobs, key=lambda job: {"hot": 0, "leaf": 1, "cold": 2}[job.mode])
     running = {}
     optimizer = [
         to_number[i]
@@ -228,9 +339,15 @@ def run_jobs(jobs, maps, policy, output):
             note = "NO ANSWER"
         else:
             numbers = [to_number[i] for i in job.keep]
-            numbers += [to_number[i] for i in job.verify if job.states.get(i) != "P"]
+            unsettled = [i for i in job.verify if job.states.get(i) != "P"]
+            numbers += [to_number[i] for i in unsettled]
             timed_out = any(state == "T" for state in job.states.values())
             note = ""
+            if job.evidence:
+                if unsettled or not job.done:
+                    numbers += [to_number[i] for i in job.evidence]
+                else:
+                    note = f"dropped {len(job.evidence)} on evidence"
             if timed_out or not job.done:
                 note = "TIMEOUT" if timed_out else "INCOMPLETE"
                 # A hang or a dead verifier in the optimizer suite stalls its shared pool.
@@ -238,48 +355,82 @@ def run_jobs(jobs, maps, policy, output):
                     numbers += optimizer
         numbers = sorted(set(numbers) | set(unknown))
         cost, workers = pack(numbers, ms)
+        passed = sum(1 for state in job.states.values() if state == "P")
         log(
             job.commit,
-            f"-> {len(numbers)} tests ({cost / 1000:.1f}s) after verifying "
-            f"{len(job.verify)}, keeping {len(job.keep)} {note}",
+            f"-> {len(numbers)} tests ({cost / 1000:.1f}s): {passed} of {len(job.verify)} "
+            f"checked and passed, {len(job.keep)} kept {note} [{time.monotonic() - START:.1f}s]",
         )
         output[job.commit] = workers
 
     def launch(job):
-        read_fd, write_fd = os.pipe()
-        pid = os.fork()
-        if pid == 0:
-            os.close(read_fd)
-            for other in running.values():
-                try:
-                    os.close(other.fd)
-                except OSError:
-                    pass
-            verify.child(ROOT, job, policy, maps, write_fd, MEMORY_BYTES, log_fd=2)
-            os._exit(0)
-        os.close(write_fd)
-        job.pid = pid
-        job.fd = read_fd
+        job.reset()
+        if job.mode in servers:
+            os.write(servers[job.mode], f"{jobs.index(job)}\n".encode())
+        else:
+            job.mode = "cold"
+            read_fd, write_fd = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(read_fd)
+                for other in jobs:
+                    if other.read_fd is not None:
+                        try:
+                            os.close(other.read_fd)
+                        except OSError:
+                            pass
+                for fd in servers.values():
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                verify.child(ROOT, job, "cold", policy, maps, write_fd, MEMORY_BYTES, log_fd=2)
+                os._exit(0)
+            os.close(write_fd)
+            job.pid = pid
+            job.own_child = True
+            job.read_fd = read_fd
         job.deadline = time.monotonic() + 45.0
-        running[read_fd] = job
+        running[job.read_fd] = job
 
     def reap(job, kill=False):
-        if kill:
+        if kill and job.pid:
             try:
                 os.kill(job.pid, signal.SIGKILL)
             except OSError:
                 pass
         try:
-            os.close(job.fd)
+            os.close(job.read_fd)
         except OSError:
             pass
-        try:
-            os.waitpid(job.pid, 0)
-        except OSError:
-            pass
-        shutil.rmtree(f"/tmp/br{job.pid}", ignore_errors=True)
-        del running[job.fd]
+        if job.own_child:
+            try:
+                os.waitpid(job.pid, 0)
+            except OSError:
+                pass
+        if job.pid:
+            shutil.rmtree(f"/tmp/br{job.pid}", ignore_errors=True)
+        del running[job.read_fd]
+        job.read_fd = None
+        if (job.retry or not job.announced) and not job.retried and job.mode != "cold" and not kill:
+            # The quick way did not work out: do it the slow, sure way.
+            job.retried = True
+            job.mode = "cold"
+            if job.diff_modules:
+                job.plan = None
+            pending.insert(0, job)
+            return
         finish(job)
+
+    def close_idle_servers():
+        for mode in list(servers):
+            if not any(job.mode == mode for job in pending) and not any(
+                job.mode == mode for job in running.values()
+            ):
+                try:
+                    os.close(servers.pop(mode))
+                except OSError:
+                    pass
 
     while pending or running:
         out_of_time = time.monotonic() - START > WALL_BUDGET
@@ -287,6 +438,7 @@ def run_jobs(jobs, maps, policy, output):
             launch(pending.pop(0))
         if out_of_time:
             for job in pending:
+                job.announced = False
                 finish(job)
                 log(job.commit, "out of time: scheduled without verifying")
             pending = []
@@ -311,23 +463,31 @@ def run_jobs(jobs, maps, policy, output):
                 line, job.buffer = job.buffer.split(b"\n", 1)
                 if line == b"D":
                     job.done = True
+                elif line == b"X":
+                    job.retry = True
                 elif line == b"A":
                     job.announced = True
                     estimate = sum(policy.cpu[i] for i in job.verify)
                     job.deadline = now + 30.0 + 6.0 * estimate
                 else:
                     kind, _, value = line.partition(b" ")
-                    index = int(value)
-                    if kind == b"K":
-                        job.keep.append(index)
+                    number = int(value)
+                    if kind == b"I":
+                        job.pid = number
+                    elif kind == b"K":
+                        job.keep.append(number)
+                    elif kind == b"E":
+                        job.evidence.append(number)
                     elif kind == b"V":
-                        job.verify.append(index)
+                        job.verify.append(number)
                     else:
-                        job.states[index] = kind.decode()
+                        job.states[number] = kind.decode()
         for job in list(running.values()):
             if now > job.deadline:
                 log(job.commit, "verifier past its deadline")
                 reap(job, kill=True)
+                continue
+            if not job.pid:
                 continue
             try:
                 with open(f"/proc/{job.pid}/statm") as handle:
@@ -337,6 +497,18 @@ def run_jobs(jobs, maps, policy, output):
             if resident > RSS_LIMIT:
                 log(job.commit, "verifier using too much memory")
                 reap(job, kill=True)
+        close_idle_servers()
+
+    for fd in servers.values():
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if server_pid:
+        try:
+            os.waitpid(server_pid, 0)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

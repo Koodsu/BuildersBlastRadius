@@ -7,6 +7,7 @@ patched file, so the two can be compared without caring about line numbers.
 from __future__ import annotations
 
 import ast
+import dis
 import hashlib
 import types
 
@@ -24,13 +25,68 @@ def _const_key(const):
     return (type(const).__name__, repr(const))
 
 
+_HASCONST = frozenset(dis.hasconst)
+_LOAD_CONST = dis.opmap["LOAD_CONST"]
+_STORE_NAME = dis.opmap["STORE_NAME"]
+_EXTENDED_ARG = dis.opmap["EXTENDED_ARG"]
+
+
+def _body_docstring(code):
+    """Index in co_consts of the string a module or class body stores as __doc__, or None."""
+    try:
+        target = code.co_names.index("__doc__")
+    except ValueError:
+        return None
+    raw = code.co_code
+    previous = None
+    extended = False
+    for offset in range(0, len(raw), 2):
+        op, arg = raw[offset], raw[offset + 1]
+        if op == _STORE_NAME and arg == target and not extended:
+            if previous is not None and isinstance(code.co_consts[previous], str):
+                return previous
+            return None
+        previous = arg if op == _LOAD_CONST and not extended else None
+        extended = op == _EXTENDED_ARG
+    return None
+
+
+def _has_docstring(code):
+    """True if a function's first constant is its docstring.
+
+    Python 3.13 keeps a docstring as constant 0 without any instruction loading it.
+    """
+    consts = code.co_consts
+    if not consts or not isinstance(consts[0], str):
+        return False
+    raw = code.co_code
+    extended = False
+    for offset in range(0, len(raw), 2):
+        op = raw[offset]
+        if op in _HASCONST and raw[offset + 1] == 0 and not extended:
+            return False
+        extended = op == _EXTENDED_ARG
+    return True
+
+
 def own_digest(code: types.CodeType) -> str:
-    """Hash of everything a code object does itself, ignoring line numbers and nested code."""
+    """Hash of everything a code object does itself.
+
+    Ignores line numbers, nested code and docstrings: none of them changes what
+    the code does, and nothing in sqlglot or its tests reads a docstring.
+    """
     consts = [_const_key(const) for const in code.co_consts]
-    if "__firstlineno__" in code.co_names and not code.co_flags & CO_OPTIMIZED:
-        # Python 3.13 stores a class body's first line in its constants.
-        marker = ("int", repr(code.co_firstlineno))
-        consts = [("<firstlineno>",) if const == marker else const for const in consts]
+    if code.co_flags & CO_OPTIMIZED:
+        if _has_docstring(code):
+            consts[0] = ("<doc>",)
+    else:
+        doc = _body_docstring(code)
+        if doc is not None:
+            consts[doc] = ("<doc>",)
+        if "__firstlineno__" in code.co_names:
+            # Python 3.13 stores a class body's first line in its constants.
+            marker = ("int", repr(code.co_firstlineno))
+            consts = [("<firstlineno>",) if const == marker else const for const in consts]
     payload = repr(
         (
             code.co_code,
@@ -83,6 +139,7 @@ def code_tree(code: types.CodeType) -> dict:
                 low = min(low, child_low)
                 high = max(high, child_high)
         tree[path] = {
+            "name": node.co_name,
             "kind": kind_of(node),
             "digest": own_digest(node),
             "own": sorted(own),

@@ -17,18 +17,18 @@ RUN mkdir /sg && tar -xzf /build/sqlglot.tar.gz -C /sg --strip-components=1 \
 
 FROM base AS final
 COPY br /app/br
-# Maps built from the pinned commit by `make maps` (br/tracer.py, br/aggregate.py,
-# br/basestate.py): which lines and class attributes each test touches, which
-# files it reads, and a fingerprint of sqlglot's import-time state.
+# Maps built from the pinned commit by `make maps`: which lines and class
+# attributes each test touches, which files it reads and depends on, how long
+# it takes, and a fingerprint of sqlglot's import-time state.
 COPY maps.tar.xz /build/maps.tar.xz
 RUN mkdir /app/maps && python -m tarfile -e /build/maps.tar.xz /app/maps \
     && rm /build/maps.tar.xz \
     && python -m compileall -q /app/br \
     && chmod -R a+rX /app
 COPY selector.py /app/selector.py
-# BR_PROBE=1: a test too expensive to check in full (the three that make up half
-# the suite's run time) is judged on a part of itself once a dozen cheaper tests
-# that run the same changed code have passed. Set it to 0 to schedule such a test
-# whenever it could be affected: slower on average, but never a judgment call.
+# BR_PROBE=1: the two tests too expensive to verify (about 21 s and 29 s) are
+# left out when every other test that runs the changed statement has been run
+# here and has passed. Evidence, not proof. Set it to 0 to schedule them
+# whenever they could be affected.
 ENV BR_PROBE=1
 CMD ["python", "/app/selector.py"]
