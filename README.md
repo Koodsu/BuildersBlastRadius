@@ -92,11 +92,12 @@ many tests run, this happened 12 times, every time for an `is` swapped with
 `==`, and in none of them did a test that was left out fail, or the two forms
 differ even once while it ran. `BR_DUAL=0` turns it off.
 
-**What a check costs** (`BR_CPU_FACTOR`). The seconds in `tests.json` are not
-what a test costs to run here: two scored runs put the container's CPU at
-about a third of the recorded time of the work it did. Every CPU estimate is
-the recorded-time estimate times `BR_CPU_FACTOR` (0.4, a little on the safe
-side).
+**What a check costs** (`BR_CPU_FACTOR`). Running a test here is charged as
+CPU at about what the maps estimate for it. Scored with every estimate at 0.4
+of that, the selector brought the practice set's simulated seconds from 148.9
+down to 103.1 and was charged 89.7 s of CPU for it, against 11.75 s before. So
+a check is only worth it when it is much cheaper than the seconds it can take
+off the schedule, and the factor is 1.
 
 **Cut short after the optimizer** (`br/stages.py`, `stage_prints.json`).
 `test_execute_tpcds` runs 99 queries: each is optimized, then planned and
@@ -116,19 +117,16 @@ give the same rows), and otherwise the test is scheduled. The first pass
 stops early once so much has changed that the test would be scheduled anyway.
 
 **The two giants.** `test_execute_tpcds` and `test_max_nodes` are recorded at
-about 21 s and 29 s and cost about 13 s of CPU each to run here in full. When
-the check above does not apply they are settled last, on what the other
+about 21 s and 29 s and cost more than that in CPU to run here in full, so
+they are never run in full. They are settled last, on what the other
 candidates showed:
 
 - *Left out on evidence* (`BR_PROBE=1`): every other test that runs the changed
   statement was run and passed, and there were at least a dozen. That is
   evidence, not proof. With `BR_PROBE=0` this is never done.
-- *Run for real*: otherwise, if the seconds the giant would add to the schedule,
-  times the chance that it passes, come to more than running it. A giant that
-  works through a fixture one query at a time runs only the queries that reach
-  the change, the cheap ones first in a pass of their own, and stops at the
-  first that fails.
-- *Scheduled*: when neither applies.
+- *Checked after the optimizer*: `test_execute_tpcds`, when the check above
+  applies. Exact.
+- *Scheduled*: when none applies, or the check would cost more than it can save.
 
 **Units of a test are not isolated.** A pooled test is cut down to the units of
 work that reach a change only for edits to function bodies. sqlglot builds

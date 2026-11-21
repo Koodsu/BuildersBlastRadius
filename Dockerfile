@@ -36,9 +36,9 @@ COPY selector.py /app/selector.py
 # and 29 s) are left out when every other test that runs the changed statement
 # has been run here and has passed. Evidence, not proof. With 0 they are run
 # here, or scheduled, whenever they could be affected.
-# BR_CPU_FACTOR: CPU seconds charged for work recorded as one second of test
-# time. Two scored runs put it near a third.
-ENV BR_PROBE=1 BR_CPU_FACTOR=0.4
+# BR_CPU_FACTOR: CPU seconds charged for work estimated at one second. Scored at
+# 0.4 the selector spent 89.7 s of CPU to save 46 s of simulated time.
+ENV BR_PROBE=1 BR_CPU_FACTOR=1.0
 # BR_DUAL=1: when the edit is one side-effect-free expression, the old and the
 # new form are evaluated side by side in every candidate that is cheap to run.
 # If they never differ, the candidates that are dear to run are left out.

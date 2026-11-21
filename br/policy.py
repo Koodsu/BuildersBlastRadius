@@ -6,10 +6,11 @@ Verifying costs the CPU of running the tests. Once something fails a worker is
 needed anyway, so from then on a test is only checked while what it would add
 to that worker is worth more than the check.
 
-The recorded seconds in tests.json are not what a test costs to run here. Two
-scored runs put the whole container's CPU at about a third of the recorded
-time of the work it did, so every CPU cost is the recorded-time estimate times
-CPU_FACTOR.
+Every CPU cost is the recorded-time estimate times CPU_FACTOR. The factor is 1:
+scored at 0.4, this selector brought the simulated seconds of the practice set
+from 148.9 down to 103.1 and was charged 89.7 s of CPU for it, where the
+version before was charged 11.75 s. Checking is not cheap on the scorer. (The
+0.4 came from comparing CPU on two sets of commits that were not alike.)
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ WORKER_MS = 2000
 MAX_WORKERS = 8
 
 # CPU seconds the scorer charges for work recorded as one second of test time.
-CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "0.4"))
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.0"))
 
 P_FAIL = 0.5  # chance that a change which reaches candidates breaks at least one
 EARLY = 0.25  # share of the checking done before a failure shows, when there is one
@@ -42,6 +43,12 @@ LATE_PASS = 0.8  # chance a giant passes when everything else did
 LATE_ALONE = 0.5  # ...when nothing else was run
 LATE_FLOOR = 0.3  # ...at the least, however many of the others failed
 LATE_EARLY = 0.3  # share of a giant's cost spent before it fails, when it fails
+# When a giant that does its work in units (the executor's TPC-DS test: one
+# query a unit) is run here, its cheapest units go first, in a pass of their
+# own, so that a failure shows early. They are no evidence for the rest: of 19
+# generated edits that break that test, 4 passed every one of the cheapest
+# units (a fifth of the cost), so a pass there never stands in for the test.
+PREFIX_SHARE = 0.2
 
 # Dropping on evidence: a test far too expensive to verify here is left out once
 # every other test that runs the same changed statement has been run and has

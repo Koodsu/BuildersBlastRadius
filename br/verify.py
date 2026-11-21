@@ -40,7 +40,7 @@ import time
 import types
 
 from br import analyze, cells
-from br.policy import CPU_FACTOR, PROBE_MIN, plan_slices, slice_cost
+from br.policy import CPU_FACTOR, PREFIX_SHARE, PROBE_MIN, plan_slices, slice_cost
 
 HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")
 WALL_END = None  # time.monotonic() at which the selector stops waiting for verifiers
@@ -551,7 +551,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
         cut = 0
         for i in to_verify + giants:
             name = policy.tests[i]
-            if i in slices and i not in giants:
+            if i in slices and (i not in giants or ("staged", i) in slices):
                 runner.SLICE[name] = slices[i][:3]
             part = slices.get(("s", i))
             if part is not None:
@@ -741,11 +741,14 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 first = 0
                 spent = 0.0
                 for u in members:
-                    if spent + costs[u] > 0.2 * total:
+                    if spent + costs[u] > PREFIX_SHARE * total:
                         break
                     first |= 1 << u
                     spent += costs[u]
                 if first and first != wanted:
+                    # The cheap units first, so a failure shows early; then the rest.
+                    # What the pool's workers are started with is pickled in the
+                    # second pass.
                     passes = [
                         ((units["mode"], first, count), True),
                         ((units["mode"], wanted & ~first, count), False),
