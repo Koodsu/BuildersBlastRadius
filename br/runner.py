@@ -12,7 +12,6 @@ import importlib
 import pickle
 import signal
 import time
-import types
 import unittest
 from concurrent.futures import Future
 
@@ -37,9 +36,6 @@ UNIT_LISTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpch": "tpch_sqls",
 }
 UNIT_HOOK = None  # build time: called with ("submit" | "result", unit number)
-# Tests run with only some of their top-level statements (see br/stmts.py):
-# test id -> (the test's statement units, bitset of the units to keep).
-STMT: dict = {}
 _UNITS = {"count": 0, "plan": None, "light": False}
 
 
@@ -120,12 +116,6 @@ def install_inline_pools():
 def limit_duckdb_threads(count=2):
     """duckdb starts a thread per host core for every database; the run has two CPUs
     and a cap on processes."""
-    import sys
-
-    duckdb = sys.modules.get("duckdb")
-    if isinstance(duckdb, _LazyModule):
-        _DUCKDB_THREADS[0] = count  # applied when the real module is loaded
-        return
     try:
         import duckdb
     except Exception:  # noqa: BLE001
@@ -142,68 +132,6 @@ def limit_duckdb_threads(count=2):
 
     connect._br_limited = True
     duckdb.connect = connect
-
-
-# The optimizer and executor test modules import duckdb, numpy and pandas at the
-# top, which costs most of a second, and few of their tests touch them. A stand-in
-# takes each module's place until something reads an attribute of it.
-HEAVY_MODULES = ("numpy", "pandas", "pandas.testing", "duckdb")
-_DUCKDB_THREADS = [None]
-_LAZY: dict = {}
-
-
-class _LazyModule(types.ModuleType):
-    def __getattr__(self, name):
-        if name.startswith("__") and name.endswith("__"):
-            raise AttributeError(name)
-        value = getattr(load_heavy(self.__name__), name)
-        try:
-            object.__setattr__(self, name, value)
-        except Exception:  # noqa: BLE001
-            pass
-        return value
-
-
-def load_heavy(name=None):
-    """Replace the stand-ins with the real modules. Returns the one asked for."""
-    import sys
-
-    if _LAZY:
-        stand_ins = dict(_LAZY)
-        _LAZY.clear()
-        for key, module in stand_ins.items():
-            if sys.modules.get(key) is module:
-                del sys.modules[key]
-        # numpy first: pandas and duckdb reach for its C interface while loading.
-        for key in HEAVY_MODULES:
-            if key in stand_ins:
-                try:
-                    importlib.import_module(key)
-                except Exception:  # noqa: BLE001
-                    pass
-        if _DUCKDB_THREADS[0] is not None:
-            limit_duckdb_threads(_DUCKDB_THREADS[0])
-    return importlib.import_module(name) if name else None
-
-
-def install_lazy_heavy():
-    """Put stand-ins for the heavy third-party modules into sys.modules."""
-    import sys
-
-    if any(name in sys.modules for name in HEAVY_MODULES):
-        return
-    for name in HEAVY_MODULES:
-        module = _LazyModule(name)
-        module.__path__ = []  # lets `from pandas.testing import ...` resolve the stand-in
-        module.__spec__ = None
-        _LAZY[name] = module
-        sys.modules[name] = module
-
-    def assert_frame_equal(*args, **kwargs):
-        return load_heavy("pandas.testing").assert_frame_equal(*args, **kwargs)
-
-    _LAZY["pandas.testing"].assert_frame_equal = assert_frame_equal
-    _LAZY["pandas"].testing = _LAZY["pandas.testing"]
 
 
 def split_id(test_id: str):
@@ -244,9 +172,7 @@ class Result(unittest.TestResult):
 
     @property
     def shouldStop(self):
-        # With a "keep_going" set the suite carries on and skips the tests outside it.
-        stop = self._stop
-        return bool(stop and stop.get("stop") and not stop.get("keep_going"))
+        return bool(self._stop and self._stop.get("stop"))
 
     @shouldStop.setter
     def shouldStop(self, value):
@@ -295,18 +221,6 @@ class Result(unittest.TestResult):
         _UNITS["plan"] = plan = SLICE.get(test_id)
         _UNITS["light"] = test_id in LIGHT
         self._trimmed = None
-        self._swapped = None
-        cut = STMT.get(test_id)
-        if cut is not None:
-            try:
-                from br import stmts
-
-                function = stmts.target_function(type(test), test._testMethodName)
-                self._swapped = stmts.install(
-                    type(test), test._testMethodName, cut[0], cut[1], function.__code__.co_filename
-                )
-            except Exception:  # noqa: BLE001
-                self._swapped = None  # it runs whole
         attribute = UNIT_LISTS.get(test_id) if plan is not None else None
         if attribute is not None:
             entries = getattr(type(test), attribute, None)
@@ -330,10 +244,6 @@ class Result(unittest.TestResult):
         if test_id is None:
             return
         self.seen.add(test_id)
-        if getattr(self, "_swapped", None) is not None:
-            function, original = self._swapped
-            function.__code__ = original
-            self._swapped = None
         if getattr(self, "_trimmed", None) is not None:
             owner, attribute, entries = self._trimmed
             setattr(owner, attribute, entries)
@@ -359,20 +269,6 @@ class Result(unittest.TestResult):
 
 def _alarm(signum, frame):
     raise TestTimeout()
-
-
-class _Suite(unittest.TestSuite):
-    """A suite that, once something has failed, only runs the tests still worth checking."""
-
-    _cleanup = False
-    _br_stop = None
-
-    def __iter__(self):
-        stop = self._br_stop
-        for case in self._tests:
-            if stop and stop.get("stop") and case._br_id not in stop.get("keep_going", ()):
-                continue
-            yield case
 
 
 _MISSING = object()
@@ -406,8 +302,7 @@ def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None,
     bare:   optional set of test ids known to pass without their class's
             setUpClass. A class whose tests here are all in it skips that setup.
     stop:   optional dict; once stop['stop'] is true no further test starts,
-            and tests that never started are not reported. If it holds a set
-            'keep_going', the tests in that set are still run.
+            and tests that never started are not reported.
     Returns (failed_ids, timed_out_ids, class_errors).
     """
     signal.signal(signal.SIGALRM, _alarm)
@@ -425,10 +320,7 @@ def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None,
 
     for (module_name, class_name), members in groups:
         if stop and stop.get("stop"):
-            allowed = stop.get("keep_going") or ()
-            members = [member for member in members if member[0] in allowed]
-            if not members:
-                continue
+            break
         try:
             module = importlib.import_module(module_name)
             klass = getattr(module, class_name)
@@ -461,9 +353,7 @@ def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None,
         if bare and all(case._br_id in bare for case in cases):
             stripped = _strip_class_fixtures(klass)
         try:
-            suite = _Suite(cases)
-            suite._br_stop = stop
-            suite.run(result)
+            unittest.TestSuite(cases).run(result)
         except TestTimeout:
             pass
         finally:
@@ -477,7 +367,7 @@ def run(test_ids, limits=None, report=None, timings=None, stop=None, units=None,
             units.update(result.units)
         class_errors.extend(result.class_errors)
         if stop and stop.get("stop"):
-            continue  # what did not run was left out on purpose
+            break
         # A class whose setUpClass failed never starts its tests: they all error.
         for case in cases:
             if case._br_id not in result.seen:

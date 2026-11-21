@@ -35,10 +35,9 @@ import time
 import types
 
 from br import analyze, cells
-from br.policy import plan_slices, slice_cost
+from br.policy import plan_slices
 
 HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")
-CONTINUE_RATIO = float(os.environ.get("BR_CONTINUE", "0.3"))
 
 
 def make_tree(base, dest, patched):
@@ -425,36 +424,17 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             f"(est {estimate:.1f}s), keep {len(keep)}, drop on evidence {len(dropped)}"
         )
         limits = {}
-        cut = 0
         for i in to_verify:
             name = policy.tests[i]
             if i in slices:
                 runner.SLICE[name] = slices[i][:3]
-            part = slices.get(("s", i))
-            if part is not None:
-                record = maps.stmts(i)
-                if record is not None:
-                    runner.STMT[name] = (record, part[0])
-                    cut += 1
-            limits[name] = 3.0 + 4.0 * slice_cost(slices, i, policy.cpu[i])
-        if cut:
-            log(f"{cut} tests cut down to the statements that reach the change")
+            limits[name] = 3.0 + 4.0 * (slices[i][3] if i in slices else policy.cpu[i])
 
         test_ids = [policy.tests[i] for i in to_verify]
         if any(name.startswith(HEAVY) for name in test_ids):
             runner.limit_duckdb_threads()
         index_of = dict(zip(test_ids, to_verify))
-        # After a first failure a worker is needed anyway, and checking only pays
-        # for tests that cost far less to run here than to schedule.
-        state = {
-            "stop": False,
-            "keep_going": {
-                policy.tests[i]
-                for i in to_verify
-                if slice_cost(slices, i, policy.cpu[i])
-                <= max(0.01, CONTINUE_RATIO * policy.ms[policy.to_number[i]] / 1000)
-            },
-        }
+        state = {"stop": False}
 
         def report(test_id, status):
             os.write(write_fd, f"{status} {index_of[test_id]}\n".encode())
@@ -475,7 +455,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 name = policy.tests[i]
                 if name not in timings:
                     continue
-                guess = slice_cost(slices, i, policy.cpu[i])
+                guess = slices[i][3] if i in slices else policy.cpu[i]
                 rows.append((timings[name], guess, policy.ms[policy.to_number[i]] / 1000, name))
             rows.sort(reverse=True)
             total = sum(row[0] for row in rows)
