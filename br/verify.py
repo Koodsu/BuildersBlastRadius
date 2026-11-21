@@ -22,6 +22,7 @@ named by their build-order index:
     A           the lists above are complete
     G <i>       starting to run giant i
     P/F/T/U <i> passed / failed / timed out / sliced run did not go as planned
+    Q <i>       left out: old and new never differed in anything that ran
     D           finished
 """
 
@@ -39,11 +40,32 @@ import time
 import types
 
 from br import analyze, cells
-from br.policy import CPU_FACTOR, PROBE_MIN, plan_slices
+from br.policy import CPU_FACTOR, PROBE_MIN, plan_slices, slice_cost
 
 HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")
 WALL_END = None  # time.monotonic() at which the selector stops waiting for verifiers
 SLOW = float(os.environ.get("BR_SLOW", "1"))  # development: stretch time limits on a slow machine
+
+# Old and new side by side (see br/dual.py). When the edited expression has been
+# evaluated often enough, in enough tests, in every candidate that is cheap to
+# run, and its old and new form never once differed, the candidates that are
+# dear to run are left out: nothing they do can differ either, unless they feed
+# the expression values none of the others did.
+# Development: run every test that was cut down to some of its statements a second
+# time, whole, and log both verdicts.
+STMT_AUDIT = os.environ.get("BR_STMT_AUDIT") == "1"
+DUAL = os.environ.get("BR_DUAL", "1") == "1"
+# Development: "1" runs everything and logs what would be dropped; "2" stops a job
+# once it is clear the rule cannot apply, and otherwise runs what it would drop.
+DUAL_AUDIT = os.environ.get("BR_DUAL_AUDIT") in ("1", "2")
+DUAL_AUDIT_QUICK = os.environ.get("BR_DUAL_AUDIT") == "2"
+# Tests dearer than this to run here can be left out (given in recorded seconds).
+DUAL_CHEAP = float(os.environ.get("BR_DUAL_CHEAP", "0.25")) * CPU_FACTOR
+DUAL_MIN_EVALS = int(os.environ.get("BR_DUAL_EVALS", "300"))
+DUAL_MIN_TESTS = int(os.environ.get("BR_DUAL_TESTS", "20"))
+# When scheduling everything looked cheaper than checking: the share of that cost
+# worth spending on the cheap candidates to find out whether the edit changes nothing.
+DUAL_PROBE_SHARE = float(os.environ.get("BR_DUAL_PROBE", "0.12"))
 
 
 def make_tree(base, dest, patched):
@@ -272,10 +294,12 @@ def diff_candidates(job, maps, log, everything):
     # changed whether or not the fingerprints agree.
     seen = set(changed)
     changed += [key for key in job.forced if key not in seen]
+    job.changed_cells = list(changed)
     if not changed:
         if job.unnamed:
             log("class-level change with no visible effect: assuming the worst")
             full |= job.coarse
+            job.changed_cells = None  # unknown
         return bits, full, targets
 
     readers = maps.cell_readers()
@@ -360,10 +384,18 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
         from br import runner
 
         runner.install_inline_pools()
+        inherited = len(runner._LAZY_LOADED)
 
+        dual = None
         if mode == "hot":
             try:
                 apply_hot(job, index)
+                if DUAL and getattr(job, "dual", None) is not None:
+                    from br import dual
+
+                    dual.install()
+                    for function in index.get(job.dual[:3], ()):
+                        function.__code__ = job.dual[3]
             except Exception as error:  # noqa: BLE001
                 log(f"hot swap refused ({error!r}): retrying cold")
                 os.write(write_fd, b"X\n")
@@ -387,6 +419,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 sys.path.insert(0, dest)
             os.chdir(dest)
 
+        tracked_cells = ()
         if job.plan is not None:
             indexes, to_verify, keep, estimate, evidence, late, slices = job.plan
         else:
@@ -402,6 +435,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                     )
                     bits |= found | found_full
                     full |= found_full
+                    tracked_cells = maps.state()["tracked"]
                 except BaseException as error:  # noqa: BLE001
                     log(f"state diff failed ({error!r}); assuming the worst")
                     bits |= job.coarse
@@ -418,19 +452,6 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 droppable=bits & ~full if job.targets or cell_targets else 0,
                 diffed=diffed,
             )
-        lines = (
-            [f"K {i}" for i in keep]
-            + [f"E {i}" for i in evidence]
-            + [f"L {i}" for i in late]
-            + [f"V {i}" for i in to_verify]
-            + ["A"]
-        )
-        os.write(write_fd, ("\n".join(lines) + "\n").encode())
-        log(
-            f"{mode}: {len(indexes)} candidates, verify {len(to_verify)} "
-            f"(est {estimate:.1f}s), keep {len(keep)}, drop on evidence {len(evidence)}, "
-            f"settle last {len(late)}"
-        )
 
         # A giant that is a candidate only because the fixture its units come from
         # was edited: the units whose entries are as recorded need not run.
@@ -456,30 +477,109 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                     units["always"] * rate + 0.1 * policy.cpu[i],
                 )
 
+        # Tests a staged run left unsettled: index -> the units still to run in full.
+        scouted = {}
+        scout_over = set()  # ...and those whose scouting was ended early: too much changed
+
+        def unit_costs(i):
+            units = maps.units(i)
+            whole = units["always"] + sum(units["cost"])
+            rate = policy.cpu[i] / whole if whole > 0 else 1.0
+            return [unit * rate for unit in units["cost"]], units["always"] * rate
+
+        def scout_limit(i, passed, failed, scheduled):
+            """The share of a staged test's work past which, if that much has
+            changed, it would be scheduled anyway."""
+            _, always = unit_costs(i)
+            limit = 0.0
+            for tenth in range(1, 11):
+                share = tenth / 10
+                worth, _ = policy.late_worth(
+                    i, always + share * policy.cpu[i], scheduled, passed, failed, share
+                )
+                if worth:
+                    limit = share
+            return limit + 0.05
+
         def cost_of(i):
             if i in by_entry:
                 return by_entry[i][4]
-            return slices[i][3] if i in slices else policy.cpu[i]
+            if i in scout_over:
+                return policy.cpu[i]
+            if i in scouted:
+                costs, always = unit_costs(i)
+                return always + sum(
+                    cost for unit, cost in enumerate(costs) if scouted[i] >> unit & 1
+                )
+            return slice_cost(slices, i, policy.cpu[i])
 
         def recorded(i):
             return policy.ms[policy.to_number[i]] / 1000
 
+        # Old and new side by side: the cheap candidates go first. A test the
+        # staged check can settle is dear all the same (its class loads every
+        # table first): if old and new never differ it is spared with the rest.
+        dear = []
+        cheap_count = len(to_verify)
+        if dual is not None:
+            cheap = [i for i in to_verify if cost_of(i) <= DUAL_CHEAP]
+            dear = [i for i in to_verify if i not in set(cheap)]
+            if DUAL_AUDIT:
+                # Measuring: also run what the plan would have scheduled unrun, bar the giants.
+                extra = [i for i in keep if policy.ms[policy.to_number[i]] < 6000]
+                keep = [i for i in keep if i not in set(extra)]
+                dear += extra
+            to_verify = cheap + dear
+            cheap_count = len(cheap)
+        lines = (
+            [f"K {i}" for i in keep]
+            + [f"E {i}" for i in evidence]
+            + [f"L {i}" for i in late]
+            + [f"V {i}" for i in to_verify]
+            + ["A"]
+        )
+        os.write(write_fd, ("\n".join(lines) + "\n").encode())
+        log(
+            f"{mode}: {len(indexes)} candidates, verify {len(to_verify)} "
+            f"(est {estimate:.1f}s), keep {len(keep)}, drop on evidence {len(evidence)}, "
+            f"settle last {len(late)}"
+        )
+
         giants = list(evidence) + list(late)
         limits = {}
         staged = 0
+        cut = 0
         for i in to_verify + giants:
             name = policy.tests[i]
             if i in slices and i not in giants:
                 runner.SLICE[name] = slices[i][:3]
+            part = slices.get(("s", i))
+            if part is not None:
+                record = maps.stmts(i)
+                if record is not None:
+                    runner.STMT[name] = (record, part[0])
+                    cut += 1
             # In recorded seconds: generous, it only has to catch a hang.
             limits[name] = (3.0 + 4.0 * cost_of(i) / CPU_FACTOR) * SLOW
             if ("staged", i) in slices:
                 record = maps.stages().get(name)
-                if record:
-                    runner.STAGED[name] = record
+                if record and maps.units(i) is not None:
+                    # A first run only finds the units whose plan changed; whether
+                    # those are then run is decided once their cost is known. It ends
+                    # early when so much has changed that the test would be scheduled.
+                    others = [policy.to_number[j] for j in keep if j != i] + list(policy.unknown)
+                    runner.STAGED[name] = dict(
+                        record,
+                        scout=True,
+                        costs=unit_costs(i)[0],
+                        stop_at=scout_limit(i, len(to_verify), 0, others) * policy.cpu[i],
+                    )
                     staged += 1
-                    # Any unit may turn out to need its full run.
                     limits[name] = (3.0 + 4.0 * policy.cpu[i] / CPU_FACTOR) * SLOW
+            if DUAL_AUDIT or STMT_AUDIT:
+                limits[name] = 900.0  # measuring on a busy machine: no false alarms
+        if cut:
+            log(f"{cut} tests cut down to the statements that reach the change")
         if staged:
             log(f"{staged} tests cut short after the optimizer where nothing it hands on changed")
 
@@ -490,21 +590,119 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
         state = {"stop": False}
         counts = {"P": 0, "F": 0}
         settled = {}
+        verdicts = {}
         timings = {} if os.environ.get("BR_DEBUG") else None
+        measuring = DUAL_AUDIT or STMT_AUDIT
+        seen = {"tests": 0, "evals": 0, "differed": 0, "with_evals": 0, "last": (0, 0)}
+        spared = {"done": False}
+        dear_set = set(dear)
+
+        def settle():
+            """Every cheap candidate has run: can the dear ones be left out?"""
+            enough = (
+                not state["stop"]
+                and not scouted
+                and seen["differed"] == 0
+                and seen["evals"] >= DUAL_MIN_EVALS
+                and seen["with_evals"] >= DUAL_MIN_TESTS
+            )
+            log(
+                f"old and new compared {seen['evals']} times in {seen['with_evals']} tests, "
+                f"differed {seen['differed']} times: "
+                f"{'leaving out' if enough else 'still checking'} {len(dear)} dear tests"
+                f"{' and ' + str(len(keep) + len(giants)) + ' unrun ones' if enough and (keep or giants) else ''}"
+            )
+            if DUAL_AUDIT_QUICK and not enough:
+                state["stop"] = True
+            if not enough or DUAL_AUDIT:
+                return
+            left_out = dear + list(keep) + giants
+            os.write(write_fd, "".join(f"Q {i}\n" for i in left_out).encode())
+            spared["done"] = True
+            state["stop"] = True
 
         def report(test_id, status):
             i = index_of[test_id]
+            if dual is not None:
+                evals, differed = dual.COUNTS
+                delta = (evals - seen["last"][0], differed - seen["last"][1])
+                seen["last"] = (evals, differed)
+                seen["evals"] += delta[0]
+                seen["differed"] += delta[1]
+                seen["with_evals"] += 1 if delta[0] else 0
+                if DUAL_AUDIT:
+                    log(
+                        f"audit {i} {'dear' if i in dear_set else 'cheap'} "
+                        f"{cost_of(i):.3f} {delta[0]} {delta[1]} {status}"
+                    )
             settled[i] = status
             os.write(write_fd, f"{status} {i}\n".encode())
-            counts["P" if status == "P" else "F"] += 1
-            if status != "P":
+            verdicts[test_id] = status
+            # "U" is a check that did not finish: scheduled as things stand, but
+            # nothing was seen to fail.
+            if status != "U":
+                counts["P" if status == "P" else "F"] += 1
+            elif runner.STAGE_DIFFERS.get(test_id):
+                scouted[i] = runner.STAGE_DIFFERS.pop(test_id)
+                if test_id in runner.STAGE_OVER:
+                    scout_over.add(i)
+            if status not in ("P", "U") and not measuring:
                 # A worker is needed from here on: see what that does to the rest.
                 state["stop"] = True
+            if DUAL_AUDIT_QUICK and seen["tests"] < cheap_count and (
+                status != "P" or seen["differed"]
+            ):
+                state["stop"] = True  # the rule cannot apply to this job any more
+            seen["tests"] += 1
+            if dual is not None and seen["tests"] == cheap_count and (dear or keep or giants):
+                settle()
+
+        # A test that passes without its class's setUpClass runs without it, but
+        # only while the change cannot reach the setup: a setup that the patch
+        # breaks fails every test of its class, and a test left out unrun is only
+        # known to be unaffected if nothing it does outside its body can differ.
+        # What each setup runs and reads was recorded when the maps were built.
+        needy = set()
+        setups = maps.setups()
+        changed_cells = getattr(job, "changed_cells", None)
+        for key in {policy.tests[i].rsplit("::", 1)[0] for i in to_verify}:
+            if setups is None:
+                needy.add(key)
+                continue
+            if key not in setups:
+                continue  # a class without a setUpClass of its own
+            watched = setups[key]
+            if watched is None or job.no_slice or not job.targets and job.plan is not None:
+                needy.add(key)  # not watched, or not a change to sqlglot's functions
+                continue
+            if job.plan is None or job.diff_modules:
+                # A state diff: skip the setup only if every attribute that
+                # changed is one whose reads are recorded and the setup read none.
+                if changed_cells is None or any(
+                    cell not in tracked_cells or cell in watched["reads"] for cell in changed_cells
+                ):
+                    needy.add(key)
+                    continue
+            for source, targets in job.targets.items():
+                if not targets.isdisjoint(watched["lines"].get(source, ())):
+                    needy.add(key)
+                    break
+        bare = {name for name in policy.bare if name.rsplit("::", 1)[0] not in needy}
 
         before_run = time.process_time()
-        runner.run(
-            test_ids, limits=limits, report=report, stop=state, timings=timings, bare=policy.bare
-        )
+        runner.run(test_ids, limits=limits, report=report, stop=state, timings=timings, bare=bare)
+        if STMT_AUDIT and runner.STMT:
+            cut_ids = [name for name in test_ids if name in runner.STMT and name in verdicts]
+            runner.STMT.clear()
+            whole = {}
+            runner.run(
+                cut_ids,
+                limits={name: 600.0 for name in cut_ids},
+                report=lambda name, status: whole.__setitem__(name, status),
+                bare=bare,
+            )
+            for name in cut_ids:
+                log(f"slice {index_of[name]} {verdicts[name]} {whole.get(name, '?')} {name}")
 
         def to_schedule():
             """Test numbers that are scheduled as things stand, open giants aside."""
@@ -519,13 +717,23 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             name = policy.tests[i]
             passes = None
             units = maps.units(i) if name in runner.UNIT_LISTS else None
+            if i in scouted:
+                runner.STAGED.pop(name, None)  # the units that changed, in full this time
             if i in by_entry:
                 runner.ENTRY[name] = by_entry[i][:4]
-            elif ("staged", i) in slices:
-                pass  # its slice and its record are set: one pass, cut short unit by unit
+            elif ("staged", i) in slices and i not in scouted:
+                # Its slice and its record are set: one pass, cut short unit by unit.
+                if name in runner.STAGED:
+                    scheduled = set(to_schedule()) | {policy.to_number[j] for j in open_giants}
+                    scheduled.discard(policy.to_number[i])
+                    runner.STAGED[name]["stop_at"] = (
+                        scout_limit(i, counts["P"], counts["F"], sorted(scheduled)) * policy.cpu[i]
+                    )
             elif units is not None:
                 count = units["count"]
                 wanted = slices[i][1] if i in slices else (1 << count) - 1
+                if i in scouted:
+                    wanted = scouted[i]
                 wanted &= (1 << count) - 1
                 costs = units["cost"]
                 members = sorted((u for u in range(count) if wanted >> u & 1), key=costs.__getitem__)
@@ -542,6 +750,8 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                         ((units["mode"], first, count), True),
                         ((units["mode"], wanted & ~first, count), False),
                     ]
+                elif i in scouted:
+                    runner.SLICE[name] = (units["mode"], wanted, count)
                 elif i in slices:
                     runner.SLICE[name] = slices[i][:3]
             # One giant at a time across verifiers: the parser one needs 1.6 GB.
@@ -571,6 +781,12 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                     break
             if not outcome:
                 status = "F"
+            if status == "U" and runner.STAGE_DIFFERS.get(name) and i not in scouted:
+                scouted[i] = runner.STAGE_DIFFERS.pop(name)
+                if name in runner.STAGE_OVER:
+                    scout_over.add(i)  # too much changed: it is not run again
+                else:
+                    retry.add(i)
             settled[i] = status
             os.write(write_fd, f"{status} {i}\n".encode())
             return status == "P"
@@ -588,6 +804,14 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             open_giants += [
                 i for i in to_verify if i not in settled and recorded(i) >= PROBE_MIN
             ]
+        # A staged run that found units changed: what is left of that test is a
+        # known amount of work, weighed like a giant.
+        open_giants += [i for i in scouted if settled.get(i) == "U" and i not in open_giants]
+        retry = set()
+        if spared["done"] or measuring or getattr(job, "probe", False):
+            # Left out already, a measuring run, or a job that only asked whether
+            # the edit changes anything: nothing more is settled here.
+            open_giants = []
         while open_giants:
             i = min(open_giants, key=cost_of)
             open_giants.remove(i)
@@ -595,8 +819,15 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             # out saves little while another keeps a worker just as busy.
             scheduled = set(to_schedule()) | {policy.to_number[j] for j in open_giants}
             scheduled.discard(policy.to_number[i])
+            # The more of a test's units came out changed, the less likely it is
+            # that all of them still give the same rows.
+            changed = 0.0
+            if i in scout_over:
+                changed = 1.0
+            elif i in scouted and policy.cpu[i] > 0:
+                changed = min(1.0, cost_of(i) / policy.cpu[i])
             worth, added = policy.late_worth(
-                i, cost_of(i), sorted(scheduled), counts["P"], counts["F"]
+                i, cost_of(i), sorted(scheduled), counts["P"], counts["F"], changed
             )
             if worth and WALL_END is not None:
                 # Not if it could run into the end of the batch (and it may queue).
@@ -608,9 +839,14 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             )
             if worth and run_giant(i):
                 continue
+            if i in retry:
+                # Its first run was the staged one: weigh the units it found changed.
+                retry.discard(i)
+                open_giants.append(i)
+                continue
             staying.append(i)
             log(f"{policy.tests[i].split('::')[-1]}: stays ({settled.get(i, 'not run')})")
-            if i in settled:
+            if settled.get(i) not in (None, "U"):
                 # A giant that fails is a failure like any other: no evidence left.
                 counts["F"] += 1
                 open_giants += waiting
@@ -621,7 +857,14 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
         # the schedule they ride along for nothing; otherwise each is checked
         # while it is likely enough to pass.
         rest = [i for i in to_verify if i not in settled]
-        if failed and rest and not giant_scheduled:
+        if (
+            failed
+            and rest
+            and not giant_scheduled
+            and not spared["done"]
+            and not measuring
+            and not getattr(job, "probe", False)
+        ):
             load = {
                 "open": sum(recorded(i) for i in rest),
                 "settled": sum(policy.ms[n] for n in to_schedule()) / 1000,
@@ -638,7 +881,8 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 i = index_of[test_id]
                 settled[i] = status
                 os.write(write_fd, f"{status} {i}\n".encode())
-                counts["P" if status == "P" else "F"] += 1
+                if status != "U":
+                    counts["P" if status == "P" else "F"] += 1
                 load["open"] -= recorded(i)
                 if status != "P":
                     load["settled"] += recorded(i)
@@ -649,7 +893,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 report=report_rest,
                 gate=gate,
                 timings=timings,
-                bare=policy.bare,
+                bare=bare,
             )
         os.write(write_fd, b"D\n")
         if timings:
@@ -672,10 +916,14 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                     f"est {guess:5.2f} rec {taken:5.2f}"
                 )
         usage = resource.getrusage(resource.RUSAGE_SELF)
+        loaded = [
+            name for name in ("numpy", "duckdb", "pandas") if name in runner._LAZY_LOADED[inherited:]
+        ]
         log(
             f"cpu: setup {before_run - started:.2f}s, tests "
             f"{time.process_time() - before_run:.2f}s, process total "
             f"{usage.ru_utime + usage.ru_stime:.2f}s since fork"
+            f"{'; loaded here: ' + ', '.join(loaded) if loaded else ''}"
         )
     except BaseException as error:  # noqa: BLE001
         log(f"verifier died: {error!r}")

@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import pickle
 import signal
 import sys
 import time
+import types
 import unittest
 from concurrent.futures import Future
 
@@ -46,6 +48,9 @@ UNIT_LISTS = {
 # more than allowed, the test is left out instead.
 ENTRY: dict = {}
 UNIT_HOOK = None  # build time: called with ("submit" | "result", unit number)
+# Tests run with only some of their top-level statements (see br/stmts.py):
+# test id -> (the test's statement units, bitset of the units to keep).
+STMT: dict = {}
 _UNITS = {"count": 0, "plan": None, "light": False, "lazy": False}
 NOT_RUN = "left out by the verifier"
 
@@ -55,11 +60,23 @@ NOT_RUN = "left out by the verifier"
 # optimizer. If a change runs no line after that point, and a query's
 # optimized expression, its tables and the SQL handed to duckdb are exactly
 # what they were at the pinned commit, the rest of that unit does what it did
-# then, so it is cut short. A unit where any of them differs runs in full.
+# then, so it is cut short. A unit where any of them differs runs in full; or,
+# when the record says "scout", is cut short as well and noted in
+# STAGE_DIFFERS, and the test's verdict is "unsure": the verifier then knows
+# which units are left to run, and what they cost, before it runs any of them.
+# With "costs" (per unit) and "stop_at" in the record, scouting ends as soon as
+# the changed units cost more than that, or once enough units have been looked
+# at that, at the rate seen so far, the units still to come would take it well
+# past that: the test is then in STAGE_OVER.
 STAGED: dict = {}  # test id -> its record from the maps (see br/stages.py)
+STAGE_DIFFERS: dict = {}  # test id -> bitset of the units a scouting run found changed
+STAGE_OVER: set = set()  # test ids whose scouting run was ended early
 STAGE_TRACE = None  # build time: the recorder
 _STAGE = {"record": None, "unit": None, "full": set(), "tables": None, "saved": None,
-          "entries": None, "cut": 0}
+          "entries": None, "cut": 0, "differs": 0, "spent": 0.0, "over": False,
+          "looked": 0, "looked_cost": 0.0, "kept_cost": 0.0}
+SCOUT_MIN_UNITS = 16  # units to look at before the rate so far says anything
+SCOUT_SLACK = 1.0  # ...and how far past the limit it must point (the limit has its own margin)
 
 
 _RAW = object()  # marks a literal piece of the fingerprint on the walker's stack
@@ -69,6 +86,10 @@ _TYPE = object()  # marks a node reached as another node's type
 class _Unchanged(BaseException):
     """Raised out of the optimizer's return when a unit is as it was. Not an Exception,
     so nothing between there and the executor swallows it."""
+
+
+class _Differs(BaseException):
+    """Raised the same way by a scouting run when a unit is not as it was."""
 
 
 def expr_digest(node):
@@ -155,14 +176,18 @@ def _stage_install(test):
             STAGE_TRACE.front(unit, text_digest((_STAGE["tables"], expr_digest(result))))
             return result
         record = _STAGE["record"]
-        if record is None or unit in _STAGE["full"] or unit >= len(record["front"]):
+        if record is None or unit >= len(record["front"]):
             return result
         expected = record["front"][unit]
-        if expected is not None and expected == text_digest(
-            (_STAGE["tables"], expr_digest(result))
+        if (
+            unit not in _STAGE["full"]
+            and expected is not None
+            and expected == text_digest((_STAGE["tables"], expr_digest(result)))
         ):
             raise _Unchanged()
-        return result
+        if record.get("scout"):
+            raise _Differs()
+        return result  # this unit runs on: planning, execution, comparison of its rows
 
     def execute(*args, **kwargs):
         tables = kwargs.get("tables")
@@ -193,7 +218,8 @@ def _stage_remove():
         saved["executor"].optimize = saved["optimize"]
         saved["module"].execute = saved["execute"]
         saved["module"].transpile = saved["transpile"]
-    _STAGE.update(record=None, unit=None, tables=None, saved=None, entries=None)
+    _STAGE.update(record=None, unit=None, tables=None, saved=None, entries=None, differs=0)
+    _STAGE.update(spent=0.0, over=False, looked=0, looked_cost=0.0)
     _STAGE["full"] = set()
 
 
@@ -236,6 +262,9 @@ def _entry_plan(test, test_id):
 
 def _execute(future, fn, args, kwargs):
     staged = _STAGE["saved"] is not None
+    if staged and _STAGE["over"]:
+        future.set_result(None)  # scouting has seen enough: nothing more is run
+        return
     if staged:
         unit = future._br_unit
         if STAGE_TRACE is not None:
@@ -246,8 +275,27 @@ def _execute(future, fn, args, kwargs):
         _STAGE["tables"] = None
     try:
         result = pickle.loads(pickle.dumps(fn(*args, **kwargs)))
-    except _Unchanged:
-        _STAGE["cut"] += 1
+    except (_Unchanged, _Differs) as outcome:
+        unit = future._br_unit
+        record = _STAGE["record"] or {}
+        costs = record.get("costs")
+        cost = costs[unit] if costs is not None and unit < len(costs) else 0.0
+        _STAGE["looked"] += 1
+        _STAGE["looked_cost"] += cost
+        if isinstance(outcome, _Unchanged):
+            _STAGE["cut"] += 1
+        else:
+            _STAGE["differs"] |= 1 << unit
+            _STAGE["spent"] += cost
+            if _STAGE["spent"] > record.get("stop_at", float("inf")):
+                _STAGE["over"] = True
+            elif (
+                _STAGE["looked"] >= SCOUT_MIN_UNITS
+                and _STAGE["looked_cost"] > 0
+                and _STAGE["spent"] / _STAGE["looked_cost"] * _STAGE["kept_cost"]
+                > SCOUT_SLACK * record.get("stop_at", float("inf"))
+            ):
+                _STAGE["over"] = True
         future.set_result(None)
     except Exception as error:
         try:
@@ -339,6 +387,12 @@ def install_inline_pools():
 def limit_duckdb_threads(count=2):
     """duckdb starts a thread per host core for every database; the run has two CPUs
     and a cap on processes."""
+    import sys
+
+    duckdb = sys.modules.get("duckdb")
+    if isinstance(duckdb, _LazyModule):
+        _DUCKDB_THREADS[0] = count  # applied when the real module is loaded
+        return
     try:
         import duckdb
     except Exception:  # noqa: BLE001
@@ -355,6 +409,101 @@ def limit_duckdb_threads(count=2):
 
     connect._br_limited = True
     duckdb.connect = connect
+
+
+# The optimizer and executor test modules import duckdb, numpy and pandas at the
+# top, which costs most of a second, and few of their tests touch them. A stand-in
+# takes each module's place until something reads an attribute of it or imports
+# one of its submodules.
+HEAVY_MODULES = ("numpy", "pandas", "pandas.testing", "duckdb")
+# What has to be real before each of them is: pandas and duckdb reach for
+# numpy's C interface while they load.
+_HEAVY_NEEDS = {
+    "numpy": ("numpy",),
+    "pandas": ("numpy", "pandas", "pandas.testing"),
+    "pandas.testing": ("numpy", "pandas", "pandas.testing"),
+    "duckdb": ("numpy", "duckdb"),
+}
+_DUCKDB_THREADS = [None]
+_LAZY: dict = {}
+_LAZY_LOADED: list = []  # what this process had to load itself
+# Attributes the import system and introspection look for on any module: a
+# stand-in answers these itself instead of loading the real module.
+_OWN_DUNDERS = frozenset(
+    (
+        "__path__", "__spec__", "__loader__", "__file__", "__cached__", "__package__",
+        "__wrapped__", "__all__", "__builtins__", "__getattr__", "__dir__", "__warningregistry__",
+        "__origin__", "__func__", "__self__", "__code__", "__module__", "__qualname__",
+        "__mro_entries__", "__set_name__", "__get__", "__set__", "__delete__",
+    )
+)
+
+
+class _LazyModule(types.ModuleType):
+    def __getattr__(self, name):
+        if name in _OWN_DUNDERS:
+            raise AttributeError(name)
+        value = getattr(load_heavy(self.__name__), name)
+        try:
+            object.__setattr__(self, name, value)
+        except Exception:  # noqa: BLE001
+            pass
+        return value
+
+
+class _LazyFinder:
+    """Importing a submodule of a stand-in loads the real package first."""
+
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        top = name.partition(".")[0]
+        if top in _LAZY and name not in _LAZY:
+            load_heavy(top)
+            import importlib.util
+
+            return importlib.util.find_spec(name)
+        return None
+
+
+def load_heavy(name):
+    """Replace a stand-in, and the ones it depends on, with the real modules."""
+    import sys
+
+    for key in _HEAVY_NEEDS.get(name, (name,)):
+        stand_in = _LAZY.pop(key, None)
+        if stand_in is None:
+            continue
+        if sys.modules.get(key) is stand_in:
+            del sys.modules[key]
+        _LAZY_LOADED.append(key)
+        try:
+            importlib.import_module(key)
+        except Exception:  # noqa: BLE001
+            pass
+        if key == "duckdb" and _DUCKDB_THREADS[0] is not None:
+            limit_duckdb_threads(_DUCKDB_THREADS[0])
+    return importlib.import_module(name)
+
+
+def install_lazy_heavy():
+    """Put stand-ins for the heavy third-party modules into sys.modules."""
+    import sys
+
+    if any(name in sys.modules for name in HEAVY_MODULES):
+        return
+    for name in HEAVY_MODULES:
+        module = _LazyModule(name)
+        module.__path__ = []  # lets `from pandas.testing import ...` resolve the stand-in
+        module.__spec__ = None
+        _LAZY[name] = module
+        sys.modules[name] = module
+
+    def assert_frame_equal(*args, **kwargs):
+        return load_heavy("pandas.testing").assert_frame_equal(*args, **kwargs)
+
+    _LAZY["pandas.testing"].assert_frame_equal = assert_frame_equal
+    _LAZY["pandas"].testing = _LAZY["pandas.testing"]
+    sys.meta_path.insert(0, _LazyFinder)
 
 
 def split_id(test_id: str):
@@ -397,7 +546,9 @@ class Result(unittest.TestResult):
 
     @property
     def shouldStop(self):
-        return bool(self._stop and self._stop.get("stop"))
+        # With a "keep_going" set the suite carries on and skips the tests outside it.
+        stop = self._stop
+        return bool(stop and stop.get("stop") and not stop.get("keep_going"))
 
     @shouldStop.setter
     def shouldStop(self, value):
@@ -441,6 +592,7 @@ class Result(unittest.TestResult):
         test_id = getattr(test, "_br_id", None)
         self._hit = False
         self._trimmed = None
+        self._swapped = None
         _UNITS["plan"] = None
         leave_out = (
             test_id is not None and self.gate is not None and not self.gate(test_id)
@@ -475,6 +627,23 @@ class Result(unittest.TestResult):
                 _STAGE["record"] = STAGED.get(test_id) if STAGE_TRACE is None else None
                 _STAGE["entries"] = getattr(type(test), UNIT_LISTS[test_id], None)
                 _STAGE["cut"] = 0
+                costs = (_STAGE["record"] or {}).get("costs") or ()
+                _STAGE["kept_cost"] = sum(
+                    cost
+                    for unit, cost in enumerate(costs)
+                    if plan is None or plan[1] >> unit & 1
+                )
+        cut = STMT.get(test_id)
+        if cut is not None:
+            try:
+                from br import stmts
+
+                function = stmts.target_function(type(test), test._testMethodName)
+                self._swapped = stmts.install(
+                    type(test), test._testMethodName, cut[0], cut[1], function.__code__.co_filename
+                )
+            except Exception:  # noqa: BLE001
+                self._swapped = None  # it runs whole
         attribute = UNIT_LISTS.get(test_id) if plan is not None else None
         if attribute is not None:
             entries = getattr(type(test), attribute, None)
@@ -499,7 +668,16 @@ class Result(unittest.TestResult):
             return
         self.seen.add(test_id)
         if _STAGE["saved"] is not None:
+            if _STAGE["differs"]:
+                STAGE_DIFFERS[test_id] = _STAGE["differs"]
+                self.unsure.add(test_id)  # those units have not been run
+                if _STAGE["over"]:
+                    STAGE_OVER.add(test_id)
             _stage_remove()
+        if getattr(self, "_swapped", None) is not None:
+            function, original = self._swapped
+            function.__code__ = original
+            self._swapped = None
         if id(test) in self.not_run:
             return
         if getattr(self, "_trimmed", None) is not None:
@@ -527,6 +705,20 @@ class Result(unittest.TestResult):
 
 def _alarm(signum, frame):
     raise TestTimeout()
+
+
+class _Suite(unittest.TestSuite):
+    """A suite that, once something has failed, only runs the tests still worth checking."""
+
+    _cleanup = False
+    _br_stop = None
+
+    def __iter__(self):
+        stop = self._br_stop
+        for case in self._tests:
+            if stop and stop.get("stop") and case._br_id not in stop.get("keep_going", ()):
+                continue
+            yield case
 
 
 _MISSING = object()
@@ -562,7 +754,8 @@ def run(
     bare:   optional set of test ids known to pass without their class's
             setUpClass. A class whose tests here are all in it skips that setup.
     stop:   optional dict; once stop['stop'] is true no further test starts,
-            and tests that never started are not reported.
+            and tests that never started are not reported. If it holds a set
+            'keep_going', the tests in that set are still run.
     gate:   optional callable(test_id), asked just before a test starts. False
             leaves the test out: it is not run and not reported.
     Returns (failed_ids, timed_out_ids, class_errors).
@@ -582,7 +775,10 @@ def run(
 
     for (module_name, class_name), members in groups:
         if stop and stop.get("stop"):
-            break
+            allowed = stop.get("keep_going") or ()
+            members = [member for member in members if member[0] in allowed]
+            if not members:
+                continue
         try:
             module = importlib.import_module(module_name)
             klass = getattr(module, class_name)
@@ -616,7 +812,9 @@ def run(
         if bare and all(case._br_id in bare for case in cases):
             stripped = _strip_class_fixtures(klass)
         try:
-            unittest.TestSuite(cases).run(result)
+            suite = _Suite(cases)
+            suite._br_stop = stop
+            suite.run(result)
         except TestTimeout:
             pass
         finally:
@@ -630,7 +828,7 @@ def run(
             units.update(result.units)
         class_errors.extend(result.class_errors)
         if stop and stop.get("stop"):
-            break
+            continue  # what did not run was left out on purpose
         # A class whose setUpClass failed never starts its tests: they all error.
         for case in cases:
             if case._br_id not in result.seen:

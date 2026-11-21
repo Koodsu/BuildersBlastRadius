@@ -39,4 +39,9 @@ COPY selector.py /app/selector.py
 # BR_CPU_FACTOR: CPU seconds charged for work recorded as one second of test
 # time. Two scored runs put it near a third.
 ENV BR_PROBE=1 BR_CPU_FACTOR=0.4
+# BR_DUAL=1: when the edit is one side-effect-free expression, the old and the
+# new form are evaluated side by side in every candidate that is cheap to run.
+# If they never differ, the candidates that are dear to run are left out.
+# Evidence, not proof. Set it to 0 to check or schedule those as before.
+ENV BR_DUAL=1
 CMD ["python", "/app/selector.py"]

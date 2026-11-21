@@ -58,6 +58,20 @@ SLICE_MIN = 0.2 * CPU_FACTOR  # tests cheaper than this run whole
 STAGES = os.environ.get("BR_STAGES", "1") == "1"  # cut units short after the optimizer
 STAGE_SLACK = 2.0  # a staged run is costed at this many times its share: some units run on
 STAGE_SHARE_MIN = 0.08  # ...and at no less than this share (the measured one is noisy)
+STMT_MIN = 0.02 * CPU_FACTOR  # tests cheaper than this are not cut into statement units
+STMT_SAVING = 0.004 * CPU_FACTOR  # a statement slice must leave out at least this much
+STMTS = os.environ.get("BR_STMTS", "1") == "1"
+
+
+def slice_cost(slices, index, whole):
+    """What a candidate costs to run here, given the slices planned for it."""
+    cost = whole
+    if index in slices:
+        cost = slices[index][3]
+    part = slices.get(("s", index))
+    if part is not None:
+        cost = max(0.0, min(cost, whole - part[2]))
+    return cost
 
 
 def pack(numbers, ms):
@@ -137,7 +151,7 @@ class Policy:
         slices = slices or {}
         if not indexes:
             return [], indexes, 0.0, [], []
-        cost = {i: slices[i][3] if i in slices else self.cpu[i] for i in indexes}
+        cost = {i: slice_cost(slices, i, self.cpu[i]) for i in indexes}
         recorded = {i: self.ms[self.to_number[i]] / 1000 for i in indexes}
         if any(sure >> i & 1 for i in indexes):
             # A worker is needed anyway; the others ride along for less than a check
@@ -274,11 +288,12 @@ class Policy:
             workers += 1
         return cost * (1 + MARGIN) < passing * recorded / workers
 
-    def late_worth(self, index, cost, scheduled, passed, failed):
+    def late_worth(self, index, cost, scheduled, passed, failed, changed=0.0):
         """Is a giant worth running here, given the tests already settled?
 
         `scheduled` is the test numbers that will be scheduled whatever the giant
-        does. Returns (worth it, seconds scheduling the giant would add).
+        does. `changed` is the share of its work already known to differ from
+        the pinned commit. Returns (worth it, seconds scheduling the giant would add).
         """
         number = self.to_number[index]
         without = pack(list(scheduled), self.ms)[0] / 1000
@@ -287,6 +302,7 @@ class Policy:
             passing = min(LATE_PASS, max(LATE_FLOOR, (passed + 1) / (passed + failed + 2)))
         else:
             passing = LATE_PASS if passed else LATE_ALONE
+        passing *= 1.0 - changed
         expected = cost * (passing + (1 - passing) * LATE_EARLY)
         return passing * added > expected + MARGIN, added
 
@@ -346,4 +362,28 @@ def plan_slices(maps, policy, indexes, full, targets, cell_targets, no_slice):
             cost *= max(stage["share"], STAGE_SHARE_MIN) * STAGE_SLACK
             slices[("staged", index)] = True
         slices[index] = (units["mode"], keep, count, cost)
+    if STMTS and targets and not cell_targets:
+        for index in indexes:
+            if full >> index & 1 or policy.cpu[index] < STMT_MIN:
+                continue
+            record = maps.stmts(index)
+            if record is None or record.get("traced", 0) <= 0:
+                continue
+            count = len(record["units"])
+            needed = 0
+            for source, lines in targets.items():
+                by_line = record["lines"].get(source)
+                if by_line:
+                    for line in lines:
+                        needed |= by_line.get(line, 0)
+            if not needed:
+                continue  # nothing explains why it is a candidate: run it whole
+            keep = (needed | record.get("pool", 0)) & ((1 << count) - 1)
+            costs = record["cost"]
+            rate = policy.cpu[index] / record["traced"]
+            saved = sum(costs[unit] for unit in range(count) if not keep >> unit & 1) * rate
+            if saved < STMT_SAVING:
+                continue
+            # (the statement units to keep, how many there are, CPU left out)
+            slices[("s", index)] = (keep, count, min(saved, policy.cpu[index] * 0.98))
     return slices

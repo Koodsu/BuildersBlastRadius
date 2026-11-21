@@ -15,7 +15,9 @@ run once, alone, in a fresh fork of a process that has only imported its test
 module. Recorded per test:
 
 - the source lines it executes, split into "at run time" and "while a module
-  was being imported";
+  was being imported". Entering a function counts as running its first line:
+  Python reports no line event for it, and a lambda written on one line, as
+  most entries of sqlglot's tables are, would otherwise never be seen to run;
 - the files it opens;
 - the class attributes it reads (a descriptor records the first read), and for
   class-level dicts, which entries it looks up;
@@ -25,8 +27,23 @@ module. Recorded per test:
 A fingerprint of every module global and class attribute after import is
 stored too.
 
+Four smaller maps make the run cheaper (`br/stmts.py`, `br/heavy.py`,
+`br/setups.py`, `br/modinfo.py`):
+
+- an expensive test is split into groups of top-level statements that share no
+  local name, each group is run on its own, and the lines it executes are
+  recorded;
+- which tests load duckdb, numpy or pandas;
+- which lines each test class's `setUpClass` runs, and which class attributes
+  it reads;
+- per source file, the names it imports and its `from __future__` features:
+  what the compiler needs to compile one function as it would inside its module.
+
 **Selection** (`selector.py`, `br/analyze.py`). A patched Python file is
-compiled and compared, code object by code object, with the original:
+compiled and compared, code object by code object, with the original. When
+every edited line is inside one function only that function is compiled, after
+checking that the function as it was comes out the way the maps recorded it
+(the parser is 11,000 lines and takes a second to compile whole):
 
 - same code (a comment, a blank line): nothing to run;
 - a function body changed: the tests that execute the changed statement;
@@ -54,7 +71,26 @@ sqlglot the cheapest way that is safe:
 
 Tests that use a process pool are run in-process, with arguments and results
 still pickled the way the pool would, and only the units of work the change can
-reach. Tests known not to need their class's `setUpClass` run without it.
+reach. An expensive test is run with only the statement groups that reach the
+change: a dialect's catch-all test is hundreds of independent checks, and an
+edit to one function is reached by a handful of them. A test known not to need
+its class's `setUpClass` runs without it, unless the change is on a line the
+setup runs or another candidate of the class needs it. duckdb, numpy and pandas
+are stand-ins until a test touches them.
+
+**Old and new side by side** (`br/dual.py`, `BR_DUAL` in the `Dockerfile`).
+When the edit is one expression that is safe to evaluate twice (names,
+attributes, constants, comparisons, operators), the edited function is given
+code that evaluates the new expression, as the patched program does, and each
+time the old one as well. A test in which the two never differ runs exactly as
+it does without the patch. Every candidate that is cheap to run is run this
+way. If none fails, the two forms were compared at least 300 times in at least
+20 tests, and they never once differed, the candidates that are dear to run are
+left out. That is evidence, not proof: a test that was left out could feed the
+expression a value none of the others did. On 436 generated edits to lines that
+many tests run, this happened 12 times, every time for an `is` swapped with
+`==`, and in none of them did a test that was left out fail, or the two forms
+differ even once while it ran. `BR_DUAL=0` turns it off.
 
 **What a check costs** (`BR_CPU_FACTOR`). The seconds in `tests.json` are not
 what a test costs to run here: two scored runs put the container's CPU at
@@ -71,9 +107,13 @@ optimized expression and of the SQL handed to duckdb, and the sqlglot lines
 that run after the optimizer returns. When a patch edits function bodies and
 none of the edited lines is among those, a query whose fingerprints still match
 has the same inputs and the same code from there on as it had at the pinned
-commit, so it is stopped there; a query whose fingerprints differ runs in
-full, and the first one that fails ends the test. That settles the test
-exactly for about a tenth of its cost.
+commit. So the test is first run with every query stopped right after the
+optimizer: that executes nothing and shows which queries changed. If none
+did, the test passes, exactly, for about a tenth of its cost. If some did,
+what is left is a known amount of work: those queries are run in full when
+that is worth it (the more of them changed, the less likely they all still
+give the same rows), and otherwise the test is scheduled. The first pass
+stops early once so much has changed that the test would be scheduled anyway.
 
 **The two giants.** `test_execute_tpcds` and `test_max_nodes` are recorded at
 about 21 s and 29 s and cost about 13 s of CPU each to run here in full. When
@@ -117,11 +157,13 @@ suite.
 | `br/analyze.py` | patch → candidate tests |
 | `br/verify.py` | forked verifier: state diff, then run candidates |
 | `br/runner.py` | in-process unittest runner, inline process pool |
+| `br/dual.py` | old and new expression evaluated side by side |
 | `br/policy.py` | worker packing, verify-or-schedule arithmetic |
 | `br/cells.py`, `br/pyindex.py`, `br/patch.py` | fingerprints, code structure, diff parsing |
 | `br/tracer.py`, `br/aggregate.py`, `br/timing.py`, `br/fixtures.py`, `br/basestate.py` | build the maps |
 | `br/entries.py` | fingerprints of fixture entries (`unit_entries.json`) |
 | `br/stages.py` | what the executor's tests hand on from the optimizer (`stage_prints.json`) |
+| `br/stmts.py`, `br/heavy.py`, `br/setups.py`, `br/modinfo.py` | build the maps that make the run cheaper (`stmts.py` also cuts a test down at run time) |
 | `br/reindex.py`, `br/carry.py` | refresh parts of existing maps without tracing again |
 | `tools/` | development aids (not in the image) |
 
@@ -129,8 +171,9 @@ suite.
 
 ```sh
 make sample   # build, run on the 30 sample commits under the scorer's limits, score
-make maps     # rebuild maps.tar.xz from the pinned commit (ten minutes or so)
+make maps     # rebuild maps.tar.xz from the pinned commit (a quarter of an hour)
 ```
 
-`BR_PROBE` in the `Dockerfile` turns dropping on evidence on or off;
-`BR_CPU_FACTOR` is what a recorded second of test time is taken to cost.
+`BR_PROBE` and `BR_DUAL` in the `Dockerfile` turn the two kinds of dropping on
+evidence on or off; `BR_CPU_FACTOR` is what a recorded second of test time is
+taken to cost.
