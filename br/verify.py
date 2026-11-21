@@ -17,13 +17,17 @@ named by their build-order index:
     X           this mode cannot handle the job after all: retry it cold
     K <i>       scheduled without being run
     V <i>       will be run here
-    A           the two lists above are complete
+    E <i>       a giant: left out if every V test passes, else settled like L
+    L <i>       a giant: run here last if that looks worth it, else scheduled
+    A           the lists above are complete
+    G <i>       starting to run giant i
     P/F/T/U <i> passed / failed / timed out / sliced run did not go as planned
     D           finished
 """
 
 from __future__ import annotations
 
+import fcntl
 import gc
 import importlib
 import os
@@ -35,9 +39,11 @@ import time
 import types
 
 from br import analyze, cells
-from br.policy import plan_slices
+from br.policy import CPU_FACTOR, PROBE_MIN, plan_slices
 
 HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")
+WALL_END = None  # time.monotonic() at which the selector stops waiting for verifiers
+SLOW = float(os.environ.get("BR_SLOW", "1"))  # development: stretch time limits on a slow machine
 
 
 def make_tree(base, dest, patched):
@@ -382,7 +388,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             os.chdir(dest)
 
         if job.plan is not None:
-            indexes, to_verify, keep, estimate, dropped, slices = job.plan
+            indexes, to_verify, keep, estimate, evidence, late, slices = job.plan
         else:
             bits = job.cands
             full = job.full
@@ -404,7 +410,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             slices = plan_slices(
                 maps, policy, indexes, full, job.targets, cell_targets, job.no_slice
             )
-            to_verify, keep, estimate, dropped = policy.decide(
+            to_verify, keep, estimate, evidence, late = policy.decide(
                 indexes,
                 mode=mode,
                 slices=slices,
@@ -414,59 +420,256 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             )
         lines = (
             [f"K {i}" for i in keep]
-            + [f"E {i}" for i in dropped]
+            + [f"E {i}" for i in evidence]
+            + [f"L {i}" for i in late]
             + [f"V {i}" for i in to_verify]
             + ["A"]
         )
         os.write(write_fd, ("\n".join(lines) + "\n").encode())
         log(
             f"{mode}: {len(indexes)} candidates, verify {len(to_verify)} "
-            f"(est {estimate:.1f}s), keep {len(keep)}, drop on evidence {len(dropped)}"
+            f"(est {estimate:.1f}s), keep {len(keep)}, drop on evidence {len(evidence)}, "
+            f"settle last {len(late)}"
         )
+
+        # A giant that is a candidate only because the fixture its units come from
+        # was edited: the units whose entries are as recorded need not run.
+        by_entry = {}
+        if not job.diff_modules and not job.tests_python:
+            for i in list(evidence) + list(late):
+                name = policy.tests[i]
+                if name not in runner.UNIT_LISTS:
+                    continue
+                if not job.data_bits >> i & 1 or job.code_bits >> i & 1:
+                    continue
+                units = maps.units(i)
+                digests = maps.unit_entries().get(name)
+                if units is None or not digests or len(digests) != units["count"]:
+                    continue
+                whole = units["always"] + sum(units["cost"])
+                rate = policy.cpu[i] / whole if whole > 0 else 1.0
+                by_entry[i] = (
+                    units["mode"],
+                    digests,
+                    [unit * rate for unit in units["cost"]],
+                    0.3 * policy.cpu[i],
+                    units["always"] * rate + 0.1 * policy.cpu[i],
+                )
+
+        def cost_of(i):
+            if i in by_entry:
+                return by_entry[i][4]
+            return slices[i][3] if i in slices else policy.cpu[i]
+
+        def recorded(i):
+            return policy.ms[policy.to_number[i]] / 1000
+
+        giants = list(evidence) + list(late)
         limits = {}
-        for i in to_verify:
+        staged = 0
+        for i in to_verify + giants:
             name = policy.tests[i]
-            if i in slices:
+            if i in slices and i not in giants:
                 runner.SLICE[name] = slices[i][:3]
-            limits[name] = 3.0 + 4.0 * (slices[i][3] if i in slices else policy.cpu[i])
+            # In recorded seconds: generous, it only has to catch a hang.
+            limits[name] = (3.0 + 4.0 * cost_of(i) / CPU_FACTOR) * SLOW
+            if ("staged", i) in slices:
+                record = maps.stages().get(name)
+                if record:
+                    runner.STAGED[name] = record
+                    staged += 1
+                    # Any unit may turn out to need its full run.
+                    limits[name] = (3.0 + 4.0 * policy.cpu[i] / CPU_FACTOR) * SLOW
+        if staged:
+            log(f"{staged} tests cut short after the optimizer where nothing it hands on changed")
 
         test_ids = [policy.tests[i] for i in to_verify]
-        if any(name.startswith(HEAVY) for name in test_ids):
+        if any(policy.tests[i].startswith(HEAVY) for i in to_verify + giants):
             runner.limit_duckdb_threads()
-        index_of = dict(zip(test_ids, to_verify))
+        index_of = {policy.tests[i]: i for i in to_verify + giants}
         state = {"stop": False}
+        counts = {"P": 0, "F": 0}
+        settled = {}
+        timings = {} if os.environ.get("BR_DEBUG") else None
 
         def report(test_id, status):
-            os.write(write_fd, f"{status} {index_of[test_id]}\n".encode())
+            i = index_of[test_id]
+            settled[i] = status
+            os.write(write_fd, f"{status} {i}\n".encode())
+            counts["P" if status == "P" else "F"] += 1
             if status != "P":
-                # One failure settles that a worker is needed; the rest are scheduled.
+                # A worker is needed from here on: see what that does to the rest.
                 state["stop"] = True
 
         before_run = time.process_time()
-        timings = {} if os.environ.get("BR_DEBUG") else None
         runner.run(
             test_ids, limits=limits, report=report, stop=state, timings=timings, bare=policy.bare
         )
+
+        def to_schedule():
+            """Test numbers that are scheduled as things stand, open giants aside."""
+            numbers = {policy.to_number[i] for i in keep}
+            numbers.update(policy.to_number[i] for i in to_verify if settled.get(i) != "P")
+            numbers.update(policy.to_number[i] for i in staying)
+            numbers.update(policy.unknown)
+            return sorted(numbers)
+
+        def run_giant(i):
+            """Run a giant for real. Its cheap units go first, in a pass of their own."""
+            name = policy.tests[i]
+            passes = None
+            units = maps.units(i) if name in runner.UNIT_LISTS else None
+            if i in by_entry:
+                runner.ENTRY[name] = by_entry[i][:4]
+            elif ("staged", i) in slices:
+                pass  # its slice and its record are set: one pass, cut short unit by unit
+            elif units is not None:
+                count = units["count"]
+                wanted = slices[i][1] if i in slices else (1 << count) - 1
+                wanted &= (1 << count) - 1
+                costs = units["cost"]
+                members = sorted((u for u in range(count) if wanted >> u & 1), key=costs.__getitem__)
+                total = sum(costs[u] for u in members)
+                first = 0
+                spent = 0.0
+                for u in members:
+                    if spent + costs[u] > 0.2 * total:
+                        break
+                    first |= 1 << u
+                    spent += costs[u]
+                if first and first != wanted:
+                    passes = [
+                        ((units["mode"], first, count), True),
+                        ((units["mode"], wanted & ~first, count), False),
+                    ]
+                elif i in slices:
+                    runner.SLICE[name] = slices[i][:3]
+            # One giant at a time across verifiers: the parser one needs 1.6 GB.
+            os.write(write_fd, f"G {i}\n".encode())
+            lock = os.open("/tmp/br_giant.lock", os.O_CREAT | os.O_RDWR, 0o666)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            outcome = []
+            try:
+                if passes:
+                    runner.PASSES[name] = list(passes)
+                runner.run(
+                    [name] * (len(passes) if passes else 1),
+                    limits=limits,
+                    report=lambda _, status: outcome.append(status),
+                    gate=lambda _: all(status == "P" for status in outcome),
+                    timings=timings,
+                )
+            finally:
+                runner.PASSES.pop(name, None)
+                runner.ENTRY.pop(name, None)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                os.close(lock)
+            status = "P"
+            for item in outcome:
+                if item != "P":
+                    status = item
+                    break
+            if not outcome:
+                status = "F"
+            settled[i] = status
+            os.write(write_fd, f"{status} {i}\n".encode())
+            return status == "P"
+
+        # Giants: with nothing failed and enough passed, the ones in `evidence` are
+        # left out on that alone. Any other is run here if that is the better bet.
+        failed = counts["F"] > 0
+        staying = []  # giants that end up on the schedule
+        waiting = [] if failed else list(evidence)
+        open_giants = list(late) + (list(evidence) if failed else [])
+        if failed:
+            # A long test that was not reached decides how long the schedule is,
+            # however cheap it is to check here: it is settled with the giants,
+            # before the tests that would only ride along with it.
+            open_giants += [
+                i for i in to_verify if i not in settled and recorded(i) >= PROBE_MIN
+            ]
+        while open_giants:
+            i = min(open_giants, key=cost_of)
+            open_giants.remove(i)
+            # The other giants still open are counted as scheduled: leaving one
+            # out saves little while another keeps a worker just as busy.
+            scheduled = set(to_schedule()) | {policy.to_number[j] for j in open_giants}
+            scheduled.discard(policy.to_number[i])
+            worth, added = policy.late_worth(
+                i, cost_of(i), sorted(scheduled), counts["P"], counts["F"]
+            )
+            if worth and WALL_END is not None:
+                # Not if it could run into the end of the batch (and it may queue).
+                worth = time.monotonic() + 10.0 + 3.0 * cost_of(i) < WALL_END
+            log(
+                f"{policy.tests[i].split('::')[-1]}: scheduling it adds {added:.1f}s, "
+                f"running it costs about {cost_of(i):.1f}s: "
+                f"{'run' if worth else 'schedule'}"
+            )
+            if worth and run_giant(i):
+                continue
+            staying.append(i)
+            log(f"{policy.tests[i].split('::')[-1]}: stays ({settled.get(i, 'not run')})")
+            if i in settled:
+                # A giant that fails is a failure like any other: no evidence left.
+                counts["F"] += 1
+                open_giants += waiting
+                waiting = []
+        giant_scheduled = bool(staying)
+
+        # The tests that were not reached when something failed. With a giant on
+        # the schedule they ride along for nothing; otherwise each is checked
+        # while it is likely enough to pass.
+        rest = [i for i in to_verify if i not in settled]
+        if failed and rest and not giant_scheduled:
+            load = {
+                "open": sum(recorded(i) for i in rest),
+                "settled": sum(policy.ms[n] for n in to_schedule()) / 1000,
+            }
+            load["settled"] -= load["open"]
+
+            def gate(test_id):
+                i = index_of[test_id]
+                return policy.worth_checking(
+                    i, cost_of(i), counts["P"], counts["F"], load["settled"], load["open"]
+                )
+
+            def report_rest(test_id, status):
+                i = index_of[test_id]
+                settled[i] = status
+                os.write(write_fd, f"{status} {i}\n".encode())
+                counts["P" if status == "P" else "F"] += 1
+                load["open"] -= recorded(i)
+                if status != "P":
+                    load["settled"] += recorded(i)
+
+            runner.run(
+                [policy.tests[i] for i in rest],
+                limits=limits,
+                report=report_rest,
+                gate=gate,
+                timings=timings,
+                bare=policy.bare,
+            )
         os.write(write_fd, b"D\n")
         if timings:
             # Estimated against measured cost, dearest first: for tuning the cost model.
             rows = []
-            for i in to_verify:
+            for i in to_verify + giants:
                 name = policy.tests[i]
                 if name not in timings:
                     continue
-                guess = slices[i][3] if i in slices else policy.cpu[i]
-                rows.append((timings[name], guess, policy.ms[policy.to_number[i]] / 1000, name))
+                rows.append((timings[name], cost_of(i), recorded(i), name))
             rows.sort(reverse=True)
             total = sum(row[0] for row in rows)
             log(
                 f"measured {total:.2f}s for an estimated {sum(row[1] for row in rows):.2f}s, "
                 f"recorded {sum(row[2] for row in rows):.2f}s"
             )
-            for measured, guess, recorded, name in rows[:8]:
+            for measured, guess, taken, name in rows[:8]:
                 log(
                     f"  {name.split('::')[-1][:44]:44s} measured {measured:6.2f} "
-                    f"est {guess:5.2f} rec {recorded:5.2f}"
+                    f"est {guess:5.2f} rec {taken:5.2f}"
                 )
         usage = resource.getrusage(resource.RUSAGE_SELF)
         log(

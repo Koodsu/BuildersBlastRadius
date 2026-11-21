@@ -2,9 +2,14 @@
 candidates ourselves is cheaper than scheduling them.
 
 All costs are in the scorer's seconds. Scheduling a set costs its packing.
-Verifying costs the CPU of running the tests, but only as far as the first
-failure: once something fails a worker is needed anyway and the rest are
-scheduled unverified.
+Verifying costs the CPU of running the tests. Once something fails a worker is
+needed anyway, so from then on a test is only checked while what it would add
+to that worker is worth more than the check.
+
+The recorded seconds in tests.json are not what a test costs to run here. Two
+scored runs put the whole container's CPU at about a third of the recorded
+time of the work it did, so every CPU cost is the recorded-time estimate times
+CPU_FACTOR.
 """
 
 from __future__ import annotations
@@ -14,18 +19,29 @@ import os
 WORKER_MS = 2000
 MAX_WORKERS = 8
 
+# CPU seconds the scorer charges for work recorded as one second of test time.
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "0.4"))
+
 P_FAIL = 0.5  # chance that a change which reaches candidates breaks at least one
 EARLY = 0.25  # share of the checking done before a failure shows, when there is one
 MARGIN = 0.15  # verifying must look better than scheduling by this much
 
 # Fixed cost of a verifier, by how it gets a patched sqlglot (see verify.py).
-OVERHEAD = {"hot": 0.08, "leaf": 0.35, "cold": 0.7}
-DIFF_COST = {"leaf": 0.15, "cold": 0.8}  # importing and fingerprinting state
-FILE_COST = 0.02
+OVERHEAD = {mode: cost * CPU_FACTOR for mode, cost in {"hot": 0.08, "leaf": 0.35, "cold": 0.7}.items()}
+FILE_COST = 0.02 * CPU_FACTOR
 
-BIG_TEST = 2.5  # a test this expensive to run here is not verified in full, unless...
+BIG_TEST = 2.5 * CPU_FACTOR  # a test this dear to run here is not verified in full, unless...
 BIG_RATIO = 0.6  # ...running it here costs less than this share of its recorded time
 DEAR = 1.3  # tests costing more than this many times their recorded time are "dear"
+
+# A giant is a test recorded at PROBE_MIN seconds or more that also costs this
+# much CPU to run here. Giants are settled last, on what the other tests showed:
+# left out on evidence (see PROBE), run for real, or scheduled.
+GIANT_CPU = 3.0
+LATE_PASS = 0.8  # chance a giant passes when everything else did
+LATE_ALONE = 0.5  # ...when nothing else was run
+LATE_FLOOR = 0.3  # ...at the least, however many of the others failed
+LATE_EARLY = 0.3  # share of a giant's cost spent before it fails, when it fails
 
 # Dropping on evidence: a test far too expensive to verify here is left out once
 # every other test that runs the same changed statement has been run and has
@@ -38,7 +54,10 @@ PROBE_OTHERS = int(os.environ.get("BR_PROBE_OTHERS", "12"))  # other tests that 
 PROBE_MIN = 6.0  # only tests recorded at least this long are worth the risk
 PROBE_RISK = float(os.environ.get("BR_PROBE_RISK", "6.0"))  # the risk's price, in seconds
 
-SLICE_MIN = 0.2  # tests cheaper than this run whole
+SLICE_MIN = 0.2 * CPU_FACTOR  # tests cheaper than this run whole
+STAGES = os.environ.get("BR_STAGES", "1") == "1"  # cut units short after the optimizer
+STAGE_SLACK = 2.0  # a staged run is costed at this many times its share: some units run on
+STAGE_SHARE_MIN = 0.08  # ...and at no less than this share (the measured one is noisy)
 
 
 def pack(numbers, ms):
@@ -108,22 +127,35 @@ class Policy:
         candidates that may be dropped on evidence (see PROBE). `diffed` says the
         verifier's fixed costs are already spent.
 
-        Returns (verify, keep, estimate, dropped): tests to run here in order,
-        tests to schedule without running, the expected CPU, and tests to leave
-        out if everything in `verify` passes. `verify` is empty when scheduling
-        everything is the better deal.
+        Returns (verify, keep, estimate, evidence, late): tests to run here in
+        order, tests to schedule without running, the expected CPU, giants to
+        leave out if everything in `verify` passes, and giants to settle by
+        running them once the others are done (see `late_worth`). When all
+        three of verify, evidence and late are empty, scheduling everything is
+        the better deal.
         """
         slices = slices or {}
-        if not indexes or any(sure >> i & 1 for i in indexes):
-            # A worker is needed anyway; the others ride along for less than a check costs.
-            return [], indexes, 0.0, []
+        if not indexes:
+            return [], indexes, 0.0, [], []
         cost = {i: slices[i][3] if i in slices else self.cpu[i] for i in indexes}
         recorded = {i: self.ms[self.to_number[i]] / 1000 for i in indexes}
+        if any(sure >> i & 1 for i in indexes):
+            # A worker is needed anyway; the others ride along for less than a check
+            # costs. A giant does not: it is settled by running it, if that pays.
+            late = [i for i in indexes if self.is_giant(i)]
+            return [], [i for i in indexes if i not in set(late)], 0.0, [], late
         everything = self._pack_cost(indexes)
         overhead = 0.0 if diffed else OVERHEAD[mode]
 
-        big = [i for i in indexes if cost[i] >= BIG_TEST and cost[i] >= BIG_RATIO * recorded[i]]
-        rest = [i for i in indexes if i not in set(big)]
+        giants = [i for i in indexes if recorded[i] >= PROBE_MIN and cost[i] >= GIANT_CPU]
+        # (a giant that a slice makes cheap is checked like any other test)
+        big = [
+            i
+            for i in indexes
+            if i not in set(giants) and cost[i] >= BIG_TEST and cost[i] >= BIG_RATIO * recorded[i]
+        ]
+        apart = set(big) | set(giants)
+        rest = [i for i in indexes if i not in apart]
         # Tests that cost much more to run here than they were recorded at, counting
         # the fixtures their class needs, are better scheduled than checked.
         by_class = {}
@@ -150,43 +182,54 @@ class Policy:
             cheap.extend(taken)
             dear.extend(i for i in members if i not in set(taken))
 
-        best = (everything, [], indexes, [])  # schedule everything
-        options = [(rest, [])]
+        best = (everything, [], indexes, [], [])  # schedule everything
+        options = [(rest + big, [])]
+        if big:
+            options.append((rest, big))
         if dear and cheap:
-            options.append((cheap, dear))
-        for to_run, to_schedule in options:
-            if not to_run:
+            options.append((cheap, dear + big))
+        for to_run, kept in options:
+            if not to_run and not giants:
                 continue
-            for dropping in (False, True):
-                dropped = []
-                kept = list(to_schedule)
-                extra = 0.0
-                if dropping:
-                    # Only with everything else verified: nothing scheduled on trust.
-                    if not PROBE or to_schedule:
-                        continue
-                    dropped = [
-                        i for i in big if droppable >> i & 1 and recorded[i] >= PROBE_MIN
-                    ]
-                    to_run = to_run + [i for i in big if i not in set(dropped)]
-                    if not dropped or len(to_run) < PROBE_OTHERS:
-                        continue
-                    extra = PROBE_RISK * len(dropped)
+            # Left out on evidence only with everything else verified: nothing
+            # scheduled on trust, and enough other tests to count as evidence.
+            evidence = [
+                i
+                for i in giants
+                if PROBE and not kept and droppable >> i & 1 and len(to_run) >= PROBE_OTHERS
+            ]
+            late = [i for i in giants if i not in set(evidence)]
+            running = self._run_cost(to_run, cost) + overhead
+            clean = self._pack_cost(kept) if kept else 0.0
+            # What the giants cost when everything else passed: the verifier takes
+            # them cheapest first, each weighed with the others still on the schedule.
+            extra = PROBE_RISK * len(evidence)
+            passing = LATE_PASS if to_run else LATE_ALONE
+            waiting = sorted(late, key=cost.get)
+            staying = []
+            while waiting:
+                i = waiting.pop(0)
+                scheduled = [self.to_number[j] for j in kept + staying + waiting] + self.unknown
+                worth, added = self.late_worth(i, cost[i], scheduled, len(to_run), 0)
+                if worth:
+                    extra += cost[i] * (passing + (1 - passing) * LATE_EARLY)
+                    extra += (1 - passing) * added
                 else:
-                    kept += big
-                running = self._run_cost(to_run, cost) + overhead
-                clean = self._pack_cost(kept) if kept else 0.0
-                expected = (
-                    running * (1 - P_FAIL + P_FAIL * EARLY)
-                    + (1 - P_FAIL) * (clean + extra)
-                    + P_FAIL * everything
-                )
-                if expected + MARGIN < best[0]:
-                    best = (expected, list(to_run), kept, dropped)
+                    staying.append(i)
+            if staying:
+                # Together, not one by one: two giants share the cost of their workers.
+                extra += self._pack_cost(kept + staying) - clean
+            expected = (
+                running * (1 - P_FAIL + P_FAIL * EARLY)
+                + (1 - P_FAIL) * (clean + extra)
+                + P_FAIL * everything
+            )
+            if expected + MARGIN < best[0]:
+                best = (expected, list(to_run), list(kept), evidence, late)
 
-        expected, verify, keep, dropped = best
-        if not verify:
-            return [], indexes, 0.0, []
+        expected, verify, keep, evidence, late = best
+        if not verify and not evidence and not late:
+            return [], indexes, 0.0, [], []
         # Cheapest first, keeping each class together so its fixtures are built once.
         floor = {}
         for i in verify:
@@ -200,7 +243,67 @@ class Policy:
                 cost[i],
             )
         )
-        return verify, keep, self._run_cost(verify, cost) + overhead, dropped
+        return verify, keep, self._run_cost(verify, cost) + overhead, evidence, late
+
+    def is_giant(self, index):
+        number = self.to_number[index]
+        return (
+            number is not None
+            and self.ms[number] / 1000 >= PROBE_MIN
+            and self.cpu[index] >= GIANT_CPU
+        )
+
+    def worth_checking(self, index, cost, passed, failed, settled, open_load):
+        """After something has failed: is this test still worth running here?
+
+        A worker is needed whatever this test does, so checking it only pays if
+        it is likely to pass and leaving it out shortens the busiest worker.
+        `settled` is the recorded seconds of what is scheduled for certain,
+        `open_load` those of the tests not yet checked, this one included.
+        """
+        if not failed:
+            return True
+        recorded = self.ms[self.to_number[index]] / 1000
+        passing = (passed + 1) / (passed + failed + 2)
+        # Where the schedule is heading if the rest is checked too. A load T split
+        # evenly over k workers costs T/k + 2k: one more worker pays once T
+        # passes 2k(k+1).
+        load = settled + (1 - passing) * open_load
+        workers = 1
+        while workers < MAX_WORKERS and load > 2 * workers * (workers + 1):
+            workers += 1
+        return cost * (1 + MARGIN) < passing * recorded / workers
+
+    def late_worth(self, index, cost, scheduled, passed, failed):
+        """Is a giant worth running here, given the tests already settled?
+
+        `scheduled` is the test numbers that will be scheduled whatever the giant
+        does. Returns (worth it, seconds scheduling the giant would add).
+        """
+        number = self.to_number[index]
+        without = pack(list(scheduled), self.ms)[0] / 1000
+        added = pack(list(scheduled) + [number], self.ms)[0] / 1000 - without
+        if failed:
+            passing = min(LATE_PASS, max(LATE_FLOOR, (passed + 1) / (passed + failed + 2)))
+        else:
+            passing = LATE_PASS if passed else LATE_ALONE
+        expected = cost * (passing + (1 - passing) * LATE_EARLY)
+        return passing * added > expected + MARGIN, added
+
+
+def _stageable(stage, targets):
+    """True if none of the changed lines runs after the optimizer in this test.
+
+    Belt and braces: nothing in the planner or the executor is ever staged.
+    """
+    back = stage["back"]
+    for source, lines in targets.items():
+        if source.startswith("sqlglot/executor/") or source == "sqlglot/planner.py":
+            return False
+        after = back.get(source)
+        if after and not set(after).isdisjoint(lines):
+            return False
+    return bool(targets)
 
 
 def plan_slices(maps, policy, indexes, full, targets, cell_targets, no_slice):
@@ -209,7 +312,11 @@ def plan_slices(maps, policy, indexes, full, targets, cell_targets, no_slice):
     Returns {test index: (mode, units to keep, unit count, estimated cost)}.
     """
     slices = {}
-    if no_slice:
+    # Units of one test are not isolated from each other: sqlglot builds some
+    # tables on first use and keeps them (the generators' dispatch tables), so
+    # the unit that is seen to read a class attribute is only the first that
+    # needed it. A change to class-level state can reach any unit.
+    if no_slice or cell_targets:
         return slices
     sliceable = maps.meta.get("sliceable", 0)
     for index in indexes:
@@ -225,8 +332,6 @@ def plan_slices(maps, policy, indexes, full, targets, cell_targets, no_slice):
             if by_line:
                 for line in lines:
                     needed |= by_line.get(line, 0)
-        for key in cell_targets:
-            needed |= units["reads"].get(key, 0)
         if not needed:
             continue  # nothing explains why it is a candidate: run it whole
         keep = needed & ((1 << count) - 1)
@@ -234,5 +339,11 @@ def plan_slices(maps, policy, indexes, full, targets, cell_targets, no_slice):
         whole = units["always"] + sum(costs)
         part = units["always"] + sum(costs[unit] for unit in range(count) if keep >> unit & 1)
         rate = policy.cpu[index] / whole if whole > 0 else 1.0
-        slices[index] = (units["mode"], keep, count, part * rate)
+        cost = part * rate
+        stage = maps.stages().get(maps.tests[index])
+        if stage and STAGES and _stageable(stage, targets):
+            # Each unit is cut short after the optimizer unless what it hands on changed.
+            cost *= max(stage["share"], STAGE_SHARE_MIN) * STAGE_SLACK
+            slices[("staged", index)] = True
+        slices[index] = (units["mode"], keep, count, cost)
     return slices

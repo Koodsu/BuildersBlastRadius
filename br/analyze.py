@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import json
 import os
 import pickle
 import re
@@ -95,6 +96,44 @@ def _mentions(maps, root, source):
 
 
 _ASSIGN = re.compile(r"^\s*([A-Za-z_]\w*)\s*(?::[^=]*)?=(?!=)")
+# A module-level name bound to an empty container: something filled in later, at run time.
+_STORE = re.compile(
+    r"^([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*"
+    r"(?:\{\}|\[\]|set\(\)|dict\(\)|list\(\)|\w*[Dd]ict\(.*\)|\w*Dictionary\(\))\s*(?:#.*)?$",
+    re.M,
+)
+
+
+def _feeds_store(base_text, base_tree, path):
+    """True if an edited function fills, or is called by one that fills, a module-level store.
+
+    What such a function computes outlives the unit of work that ran it: other
+    units of the same test use the stored result without running the function,
+    so which units run the edited lines says nothing about which can change.
+    """
+    stores = set(_STORE.findall(base_text))
+    if not stores:
+        return False
+    lines = base_text.split("\n")
+
+    def text_of(info):
+        return "\n".join(lines[info["low"] - 1 : info["high"]])
+
+    def names(text):
+        return any(re.search(rf"\b{re.escape(store)}\b", text) for store in stores)
+
+    edited = [base_tree[path[:depth]] for depth in range(1, len(path) + 1)]
+    edited = [info for info in edited if info["kind"] == "function"]
+    if any(names(text_of(info)) for info in edited):
+        return True
+    called = {part[0] for part in path if not part[0].startswith("<")}
+    for other, info in base_tree.items():
+        if info["kind"] != "function":
+            continue
+        text = text_of(info)
+        if names(text) and any(re.search(rf"\b{re.escape(name)}\s*\(", text) for name in called):
+            return True
+    return False
 
 
 class Maps:
@@ -161,6 +200,26 @@ class Maps:
         return set(base) == set(tree) and all(
             base[path]["digest"] == info["digest"] for path, info in tree.items()
         )
+
+    def unit_entries(self):
+        """Fingerprints of the fixture entries behind tests that work in units, or {}."""
+        if "unit_entries" not in self._loaded:
+            try:
+                with open(os.path.join(self.dir, "unit_entries.json"), encoding="utf-8") as handle:
+                    self._loaded["unit_entries"] = json.load(handle)
+            except (OSError, ValueError):
+                self._loaded["unit_entries"] = {}
+        return self._loaded["unit_entries"]
+
+    def stages(self):
+        """What the executor's pooled tests do before and after the optimizer, or {}."""
+        if "stages" not in self._loaded:
+            try:
+                with open(os.path.join(self.dir, "stage_prints.json"), encoding="utf-8") as handle:
+                    self._loaded["stages"] = json.load(handle)
+            except (OSError, ValueError):
+                self._loaded["stages"] = {}
+        return self._loaded["stages"]
 
     def units(self, test_index):
         """Per-unit coverage of a test whose work splits into units, or None."""
@@ -234,6 +293,11 @@ class Analysis:
         self.reads_source = False  # a candidate opens a patched .py file as data
         self.forced = set()  # cells assigned by the edited class-level statements
         self.unnamed = False  # a class-level edit whose target could not be named
+        # Tests that are candidates because they read an edited fixture, and
+        # those that are candidates for any reason to do with code.
+        self.data_bits = 0
+        self.code_bits = 0
+        self.tests_python = False  # the patch touches a .py file under tests/
 
     def note(self, text):
         self.notes.append(text)
@@ -412,6 +476,13 @@ def analyze_python(analysis, maps, source, base_text, new_text, file_patch, root
             bits = _or_lines(rt, lines)
             import_bits = _or_lines(imf, lines)
             eager = _or_lines(ef, lines)
+            if _feeds_store(base_text, base_tree, path):
+                analysis.no_slice = True
+            if any(info["first"] in removed_lines for removed_lines, *_ in hunks):
+                # Maps traced without function starts cannot see a body that sits
+                # on the code object's first line: no unit of a test is known to
+                # run it or not.
+                analysis.no_slice = True
             analysis.cands |= bits
             analysis.targets.setdefault(source, set()).update(lines)
             analysis.translate[new_tree[path]["digest"]] = info["digest"]
@@ -497,6 +568,7 @@ def analyze(commit, patch_text, maps, root):
         (file_patch.path or "").startswith("tests/") and (file_patch.path or "").endswith(".py")
         for file_patch in file_patches
     )
+    analysis.tests_python = tests_python
     for file_patch in file_patches:
         source = file_patch.path
         if source is None:
@@ -548,6 +620,10 @@ def analyze(commit, patch_text, maps, root):
         if opened:
             analysis.cands |= opened
             analysis.full |= opened
+            if source.startswith("tests/fixtures/") and not source.endswith(".py"):
+                analysis.data_bits |= opened
+            else:
+                analysis.code_bits |= opened
             if source.endswith(".py"):
                 analysis.reads_source = True
             if source.startswith("tests/fixtures/"):
@@ -565,7 +641,11 @@ def analyze(commit, patch_text, maps, root):
                 analysis.fallback = True
                 analysis.note(f"{source}: pytest config")
                 continue
+            before = analysis.cands
+            analysis.cands = 0
             analyze_python(analysis, maps, source, base_text, new_text, file_patch, root)
+            analysis.code_bits |= analysis.cands | analysis.coarse
+            analysis.cands |= before
         elif name in PYTEST_CONFIG and (
             name in ("pytest.ini", "conftest.py", ".pytest.ini", "pytest.toml", ".pytest.toml")
             or _PYTEST_SECTION.search(new_text)
@@ -577,6 +657,7 @@ def analyze(commit, patch_text, maps, root):
             mentioned = _mentions(maps, root, source)
             analysis.cands |= mentioned
             analysis.full |= mentioned
+            analysis.code_bits |= mentioned
             analysis.note(f"{source}: outside the tree, named by {mentioned.bit_count()} tests")
         else:
             analysis.note(f"{source}: data file")

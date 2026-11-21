@@ -26,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from br import analyze, verify  # noqa: E402
-from br.policy import Policy, pack, plan_slices  # noqa: E402
+from br.policy import CPU_FACTOR, Policy, pack, plan_slices  # noqa: E402
 
 DATA = os.environ.get("BR_DATA", "/data")
 MAPS = os.environ.get("BR_MAPS", os.path.join(HERE, "maps"))
@@ -36,6 +36,7 @@ PARALLEL = 2
 WALL_BUDGET = float(os.environ.get("BR_WALL", "120"))  # stop verifying after this many seconds
 MEMORY_BYTES = 16 << 30  # address space; duckdb reserves far more than it touches
 RSS_LIMIT = 1800 << 20  # resident memory at which a verifier is killed
+GIANT_RSS_LIMIT = 2600 << 20  # ...while it runs a giant: test_max_nodes needs 1.6 GB
 PAGE = os.sysconf("SC_PAGE_SIZE")
 START = time.monotonic()
 OPTIMIZER = "tests/test_optimizer.py"
@@ -62,6 +63,9 @@ class Job:
         self.targets = analysis.targets
         self.no_slice = analysis.no_slice
         self.sure = analysis.sure
+        self.data_bits = analysis.data_bits
+        self.code_bits = analysis.code_bits
+        self.tests_python = analysis.tests_python
         self.hot = analysis.hot
         self.reads_source = analysis.reads_source
         self.plan = None  # decided up front when no state diff is needed
@@ -75,7 +79,9 @@ class Job:
         self.own_child = False
         self.buffer = b""
         self.keep = []
-        self.evidence = []  # left out if everything that is run passes
+        self.evidence = []  # giants left out if everything that is run passes
+        self.late = []  # giants scheduled unless run here and seen to pass
+        self.giant = False  # running a giant now
         self.verify = []
         self.states = {}
         self.announced = False
@@ -126,14 +132,18 @@ def main():
             mine += ours[i]
             theirs += ms[number] / 1000
     scale = min(5.0, max(0.1, theirs / mine)) if mine > 0 and theirs > 0 else 1.0
+    # ...and all of it at what the scorer charges for a recorded second.
     cpu = []
     for i, test_id in enumerate(maps.tests):
         number = to_number[i]
         if number is not None and not test_id.startswith(POOLED):
-            cpu.append(ms[number] / 1000)
+            cpu.append(ms[number] / 1000 * CPU_FACTOR)
         else:
-            cpu.append(ours[i] * scale)
-    setup_cost = {key: value * scale for key, value in (meta.get("class_setup") or {}).items()}
+            cpu.append(ours[i] * scale * CPU_FACTOR)
+    setup_cost = {
+        key: value * scale * CPU_FACTOR
+        for key, value in (meta.get("class_setup") or {}).items()
+    }
     order = {test["id"]: position for position, test in enumerate(tests)}
     policy = Policy(
         maps.tests, to_number, ms, cpu, setup_cost, order, unknown, bare=meta.get("no_setup", ())
@@ -171,7 +181,11 @@ def main():
             log(commit, "no candidates:", notes)
             output[commit] = []
             continue
-        if result.sure and not result.diff_modules:
+        if (
+            result.sure
+            and not result.diff_modules
+            and not any(policy.is_giant(i) for i in policy.indexes(result.cands))
+        ):
             numbers = [to_number[i] for i in policy.indexes(result.cands)] + unknown
             cost, workers = pack(numbers, ms)
             log(commit, f"schedule {len(numbers)} ({cost / 1000:.1f}s, sure to fail):", notes)
@@ -233,25 +247,26 @@ def main():
             slices = plan_slices(
                 maps, policy, indexes, result.full, result.targets, (), result.no_slice
             )
-            to_verify, keep, estimate, dropped = policy.decide(
+            to_verify, keep, estimate, evidence, late = policy.decide(
                 indexes,
                 mode=mode,
                 slices=slices,
                 sure=result.sure,
                 droppable=result.cands & ~result.full if result.targets else 0,
             )
-            if not to_verify:
+            if not to_verify and not evidence and not late:
                 numbers = [to_number[i] for i in indexes] + unknown
                 cost, workers = pack(numbers, ms)
                 log(commit, f"schedule {len(numbers)} ({cost / 1000:.1f}s):", notes)
                 output[commit] = workers
                 continue
-            job.plan = (indexes, to_verify, keep, estimate, dropped, slices)
+            job.plan = (indexes, to_verify, keep, estimate, evidence, late, slices)
         log(commit, f"verify ({mode}):", notes)
         jobs.append(job)
 
     log(f"analysis done: {time.process_time():.2f}s cpu")
     if jobs:
+        verify.WALL_END = START + WALL_BUDGET
         run_jobs(jobs, maps, policy, output)
 
     for commit in commits:
@@ -267,7 +282,9 @@ def run_jobs(jobs, maps, policy, output):
 
     def pooled(job):
         if job.plan is not None:
-            return any(maps.tests[i].startswith(POOLED) for i in job.plan[1])
+            return any(
+                maps.tests[i].startswith(POOLED) for i in job.plan[1] + job.plan[4] + job.plan[5]
+            )
         bits = job.cands | job.coarse
         return any(
             bits >> i & 1 for i, test_id in enumerate(maps.tests) if test_id.startswith(POOLED)
@@ -298,7 +315,7 @@ def run_jobs(jobs, maps, policy, output):
                 maps.tests[i].split("::", 1)[0][:-3].replace("/", ".")
                 for job in jobs
                 if job.mode == "hot" and job.plan is not None
-                for i in job.plan[1]
+                for i in job.plan[1] + job.plan[4] + job.plan[5]
             }
         )
         for job in served:
@@ -343,15 +360,33 @@ def run_jobs(jobs, maps, policy, output):
             numbers += [to_number[i] for i in unsettled]
             timed_out = any(state == "T" for state in job.states.values())
             note = ""
-            if job.evidence:
-                if unsettled or not job.done:
-                    numbers += [to_number[i] for i in job.evidence]
+            # A giant seen to pass here is left out. One that was not run is left
+            # out only on evidence: every other test run, all passed, no giant failed.
+            giants = job.evidence + job.late
+            doubt = (
+                bool(unsettled)
+                or not job.done
+                or any(job.states.get(i) not in (None, "P") for i in giants)
+            )
+            dropped = 0
+            for i in giants:
+                if job.states.get(i) == "P":
+                    continue
+                if i in job.late or doubt:
+                    numbers.append(to_number[i])
                 else:
-                    note = f"dropped {len(job.evidence)} on evidence"
+                    dropped += 1
+            if dropped:
+                note = f"dropped {dropped} on evidence"
             if timed_out or not job.done:
                 note = "TIMEOUT" if timed_out else "INCOMPLETE"
-                # A hang or a dead verifier in the optimizer suite stalls its shared pool.
-                if any(maps.tests[i].startswith(OPTIMIZER) for i in job.verify):
+                # A hang or a dead verifier in the optimizer suite stalls its shared
+                # pool. A giant that ran out of time here has no part in that.
+                hung = any(job.states.get(i) == "T" for i in job.verify)
+                cut_short = not job.done and any(i not in job.states for i in job.verify)
+                if (hung or cut_short) and any(
+                    maps.tests[i].startswith(OPTIMIZER) for i in job.verify
+                ):
                     numbers += optimizer
         numbers = sorted(set(numbers) | set(unknown))
         cost, workers = pack(numbers, ms)
@@ -390,7 +425,7 @@ def run_jobs(jobs, maps, policy, output):
             job.pid = pid
             job.own_child = True
             job.read_fd = read_fd
-        job.deadline = time.monotonic() + 45.0
+        job.deadline = time.monotonic() + 45.0 * verify.SLOW
         running[job.read_fd] = job
 
     def reap(job, kill=False):
@@ -467,8 +502,9 @@ def run_jobs(jobs, maps, policy, output):
                     job.retry = True
                 elif line == b"A":
                     job.announced = True
-                    estimate = sum(policy.cpu[i] for i in job.verify)
-                    job.deadline = now + 30.0 + 6.0 * estimate
+                    # Costs are the scorer's; allow for a much slower machine.
+                    estimate = sum(policy.cpu[i] for i in job.verify) / CPU_FACTOR
+                    job.deadline = now + (30.0 + 6.0 * estimate) * verify.SLOW
                 else:
                     kind, _, value = line.partition(b" ")
                     number = int(value)
@@ -478,6 +514,14 @@ def run_jobs(jobs, maps, policy, output):
                         job.keep.append(number)
                     elif kind == b"E":
                         job.evidence.append(number)
+                    elif kind == b"L":
+                        job.late.append(number)
+                    elif kind == b"G":
+                        # It may have queued behind another verifier's giant.
+                        job.giant = True
+                        job.deadline = now + (
+                            90.0 + 5.0 * policy.cpu[number] / CPU_FACTOR
+                        ) * verify.SLOW
                     elif kind == b"V":
                         job.verify.append(number)
                     else:
@@ -494,7 +538,7 @@ def run_jobs(jobs, maps, policy, output):
                     resident = int(handle.read().split()[1]) * PAGE
             except (OSError, ValueError, IndexError):
                 continue
-            if resident > RSS_LIMIT:
+            if resident > (GIANT_RSS_LIMIT if job.giant else RSS_LIMIT):
                 log(job.commit, "verifier using too much memory")
                 reap(job, kill=True)
         close_idle_servers()

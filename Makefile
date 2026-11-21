@@ -44,5 +44,7 @@ maps:
 		python -m br.timing --bare-all /sg /repo/work/maps && \
 		python -m br.fixtures /sg /repo/work/maps && \
 		python -m br.basestate /sg /repo/work/maps && \
+		python -m br.entries /sg /repo/unit_entries.json && \
+		python -m br.stages /sg /repo/stage_prints.json && \
 		rm -rf /repo/work/maps/parts && \
 		cd /repo/work/maps && python -m tarfile -c /repo/maps.tar.xz ."

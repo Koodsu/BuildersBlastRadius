@@ -25,10 +25,18 @@ RUN mkdir /app/maps && python -m tarfile -e /build/maps.tar.xz /app/maps \
     && rm /build/maps.tar.xz \
     && python -m compileall -q /app/br \
     && chmod -R a+rX /app
+# Fingerprints of the fixture entries behind the tests that work through a
+# fixture one entry at a time, made by `python -m br.entries` (part of `make maps`).
+COPY unit_entries.json /app/maps/unit_entries.json
+# What the executor's pooled tests hand on from the optimizer, and the lines
+# that run after it, made by `python -m br.stages` (part of `make maps`).
+COPY stage_prints.json /app/maps/stage_prints.json
 COPY selector.py /app/selector.py
-# BR_PROBE=1: the two tests too expensive to verify (about 21 s and 29 s) are
-# left out when every other test that runs the changed statement has been run
-# here and has passed. Evidence, not proof. Set it to 0 to schedule them
-# whenever they could be affected.
-ENV BR_PROBE=1
+# BR_PROBE=1: the two tests that cost the most to run (recorded at about 21 s
+# and 29 s) are left out when every other test that runs the changed statement
+# has been run here and has passed. Evidence, not proof. With 0 they are run
+# here, or scheduled, whenever they could be affected.
+# BR_CPU_FACTOR: CPU seconds charged for work recorded as one second of test
+# time. Two scored runs put it near a third.
+ENV BR_PROBE=1 BR_CPU_FACTOR=0.4
 CMD ["python", "/app/selector.py"]
