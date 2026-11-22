@@ -549,6 +549,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
         giants = list(evidence) + list(late)
         limits = {}
         staged = 0
+        staged_mid = 0
         cut = 0
         for i in to_verify + giants:
             name = policy.tests[i]
@@ -579,14 +580,24 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                         costs=unit_costs(i)[0],
                         stop_at=scout_limit(i, len(to_verify), 0, others) * policy.cpu[i],
                     )
+                    if slices[("staged", i)] == "mid":
+                        # The change runs after the optimizer, but not where the rows
+                        # are worked: units are cut before the rows instead.
+                        runner.STAGED[name].update(front_ok=False, mid_cut=True)
+                        staged_mid += 1
                     staged += 1
                     limits[name] = (3.0 + 4.0 * policy.cpu[i] / LIMIT_FACTOR) * SLOW
             if DUAL_AUDIT or STMT_AUDIT:
                 limits[name] = 900.0  # measuring on a busy machine: no false alarms
         if cut:
             log(f"{cut} tests cut down to the statements that reach the change")
-        if staged:
-            log(f"{staged} tests cut short after the optimizer where nothing it hands on changed")
+        if staged - staged_mid:
+            log(
+                f"{staged - staged_mid} tests cut short after the optimizer where nothing it"
+                " hands on changed"
+            )
+        if staged_mid:
+            log(f"{staged_mid} tests cut short before the rows where plan and source are unchanged")
 
         test_ids = [policy.tests[i] for i in to_verify]
         if any(policy.tests[i].startswith(HEAVY) for i in to_verify + giants):
@@ -649,6 +660,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 counts["P" if status == "P" else "F"] += 1
             elif runner.STAGE_DIFFERS.get(test_id):
                 scouted[i] = runner.STAGE_DIFFERS.pop(test_id)
+                runner.STAGE_UNKNOWN.pop(test_id, None)
                 if test_id in runner.STAGE_OVER:
                     scout_over.add(i)
             if status not in ("P", "U") and not measuring:
@@ -723,8 +735,14 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             passes = None
             units = maps.units(i) if name in runner.UNIT_LISTS else None
             if i in scouted and name in runner.STAGED:
-                # The units that changed, to the end this time.
+                # The units that changed, to the end this time; and for no longer
+                # than their own cost allows. A change can leave a query's rows as
+                # they were and make it crawl (a hash join turned into a loop).
                 runner.STAGED[name] = dict(maps.stages()[name], front_ok=False)
+                limits[name] = min(
+                    limits.get(name, float("inf")),
+                    (3.0 + 4.0 * cost_of(i) / LIMIT_FACTOR) * SLOW,
+                )
             if i in by_entry:
                 runner.ENTRY[name] = by_entry[i][:4]
             elif ("staged", i) in slices and i not in scouted:
@@ -792,6 +810,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                 status = "F"
             if status == "U" and runner.STAGE_DIFFERS.get(name) and i not in scouted:
                 scouted[i] = runner.STAGE_DIFFERS.pop(name)
+                runner.STAGE_UNKNOWN.pop(name, None)
                 if name in runner.STAGE_OVER:
                     scout_over.add(i)  # too much changed: it is not run again
                 else:

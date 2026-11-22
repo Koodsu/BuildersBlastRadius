@@ -72,6 +72,9 @@ PROBE_RISK = float(os.environ.get("BR_PROBE_RISK", "6.0"))  # the risk's price, 
 
 SLICE_MIN = 0.2 * CPU_FACTOR  # tests cheaper than this run whole
 STAGES = os.environ.get("BR_STAGES", "1") == "1"  # cut units short after the optimizer
+MID = os.environ.get("BR_MID", "1") == "1"  # ...or, failing that, before the rows are worked
+MID_MIN = 3.0  # ...and only when the units to run cost this many times the test's fixed part
+MID_SLACK = float(os.environ.get("BR_MID_SLACK", "1.25"))  # its first pass runs no unit on: priced near its share
 STAGE_SLACK = 2.0  # a staged run is costed at this many times its share: some units run on
 STAGE_SHARE_MIN = 0.08  # ...and at no less than this share (the measured one is noisy)
 STMT_MIN = 0.02 * CPU_FACTOR  # tests cheaper than this are not cut into statement units
@@ -324,18 +327,37 @@ class Policy:
 
 
 def _stageable(stage, targets):
-    """True if none of the changed lines runs after the optimizer in this test.
+    """Where this test's units can be cut short for a change to these lines.
 
-    Belt and braces: nothing in the planner or the executor is ever staged.
+    "front": none of the lines runs after the optimizer, so a unit whose
+    optimized expression is as it was is cut there. "mid": some do, but none of
+    them where the executor works the rows (stage["rows"]), so a unit whose plan
+    and generated source are as they were is cut before the rows. None: neither.
+
+    Belt and braces: nothing in the executor is ever staged, and nothing in the
+    planner is cut after the optimizer.
     """
+    if not targets:
+        return None
     back = stage["back"]
+    rows = stage.get("rows")
+    front = True
+    mid = MID and bool(rows) and any(stage.get("mid") or ()) and "mid_share" in stage
     for source, lines in targets.items():
-        if source.startswith("sqlglot/executor/") or source == "sqlglot/planner.py":
-            return False
+        if source.startswith("sqlglot/executor/"):
+            return None
+        if source == "sqlglot/planner.py":
+            front = False
         after = back.get(source)
         if after and not set(after).isdisjoint(lines):
-            return False
-    return bool(targets)
+            front = False
+        if mid:
+            own = rows.get(source)
+            if own and not set(own).isdisjoint(lines):
+                mid = False
+    if front:
+        return "front"
+    return "mid" if mid else None
 
 
 def plan_slices(maps, policy, indexes, full, targets, cell_targets, no_slice):
@@ -373,12 +395,22 @@ def plan_slices(maps, policy, indexes, full, targets, cell_targets, no_slice):
         rate = policy.cpu[index] / whole if whole > 0 else 1.0
         cost = part * rate
         stage = maps.stages().get(maps.tests[index])
-        if stage and STAGES and _stageable(stage, targets):
-            # Each unit is cut short after the optimizer unless what it hands on changed.
+        where = _stageable(stage, targets) if stage and STAGES else None
+        if where == "mid" and cost - units["always"] * rate < MID_MIN * units["always"] * rate:
+            # A first pass and then the changed units is two runs, each loading the
+            # class's tables: for a few cheap units, running them once costs less.
+            where = None
+        if where:
+            # Each unit is cut short after the optimizer unless what it hands on
+            # changed; or, for a change that runs after the optimizer, before the
+            # rows unless its plan or its generated source changed.
             # (the test's cost already allows for skipped comparisons: see selector.py)
-            cost *= max(stage["share"], STAGE_SHARE_MIN) * STAGE_SLACK
+            if where == "front":
+                cost *= max(stage["share"], STAGE_SHARE_MIN) * STAGE_SLACK
+            else:
+                cost *= max(stage["mid_share"], STAGE_SHARE_MIN) * MID_SLACK
             cost /= stage.get("result_share", 1.0) if any(stage.get("result") or ()) else 1.0
-            slices[("staged", index)] = True
+            slices[("staged", index)] = where
         slices[index] = (units["mode"], keep, count, cost)
     if STMTS and targets and not cell_targets:
         for index in indexes:

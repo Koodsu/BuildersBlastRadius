@@ -116,6 +116,24 @@ that is worth it (the more of them changed, the less likely they all still
 give the same rows), and otherwise the test is scheduled. The first pass
 stops early once so much has changed that the test would be scheduled anyway.
 
+**Cut short before the rows** (the same files). An edit to the generator, the
+planner or an expression helper does run after the optimizer, so the check
+above does not apply. But what follows the optimizer has two very unequal
+parts: the query is planned and each step's expressions are turned into Python
+source, which is quick; then the executor runs that source over the rows,
+which is nearly all of the cost. The build records which sqlglot lines the
+second part runs (the executor's own control, and everything it does row by
+row), and for every query a fingerprint of the plan and of every piece of
+generated source, taken from a run over the same tables with their rows
+removed. It checks that a run over the real rows asks for no source that the
+run without rows did not make. When none of the edited lines is among the
+second part's lines, the test is run with the rows removed: a query whose plan
+and source are what they were hands the unchanged executor the same plan, the
+same rows and the same source, so its result is what it was. Queries where
+something differs are run to the end, as above. That settles the test exactly
+for about a sixth of its cost; 1,289 of the 1,884 lines that run after the
+optimizer qualify. Edits inside `sqlglot/executor/` never do.
+
 **The comparison with duckdb, skipped** (`stage_prints.json` again). Half of
 what `test_execute_tpcds` costs is not sqlglot at all: for every query it runs
 the same SQL in duckdb and compares the two tables. The build also records a
@@ -133,8 +151,8 @@ showed:
 - *Left out on evidence* (`BR_PROBE=1`): every other test that runs the changed
   statement was run and passed, and there were at least a dozen. That is
   evidence, not proof. With `BR_PROBE=0` this is never done.
-- *Checked after the optimizer*: `test_execute_tpcds`, when the check above
-  applies. Exact.
+- *Checked after the optimizer, or before the rows*: `test_execute_tpcds`,
+  when one of the two checks above applies. Exact.
 - *Run to the end*: `test_execute_tpcds`, with the comparison skipped as above,
   when the seconds it would add to the schedule, times the chance that it
   passes, come to more than the run. It fails early when it fails: 52 of 54

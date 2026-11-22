@@ -75,13 +75,26 @@ NOT_RUN = "left out by the verifier"
 # what it was and the table has the fingerprint recorded at the pinned commit
 # (every cell's type and value, in order), that comparison comes out as it did
 # then, so it is skipped. A record with "front_ok" false allows only this.
+#
+# Between the two there is a later place to cut. After the optimizer a unit
+# plans the query, turns each step's expressions into Python source, and runs
+# that source over the rows; nearly all of the cost is the rows. With "mid_cut"
+# in the record a unit is run over the same tables with their rows taken out:
+# everything up to the rows happens as it would, in a fraction of the time. If
+# the plan and every piece of generated source are what they were at the pinned
+# commit (record["mid"]), and the change touches no line that the rest of the
+# run uses (record["rows"]: see br/stages.py), the real run would hand the same
+# source the same rows through the same code, so the unit is cut. A unit the
+# maps could not vouch for (no fingerprint) is noted in STAGE_UNKNOWN as well.
 STAGED: dict = {}  # test id -> its record from the maps (see br/stages.py)
 STAGE_DIFFERS: dict = {}  # test id -> bitset of the units a scouting run found changed
+STAGE_UNKNOWN: dict = {}  # test id -> those among them that it could not judge at all
 STAGE_OVER: set = set()  # test ids whose scouting run was ended early
 STAGE_TRACE = None  # build time: the recorder
 _STAGE = {"record": None, "unit": None, "full": set(), "tables": None, "saved": None,
           "entries": None, "cut": 0, "differs": 0, "spent": 0.0, "over": False,
-          "looked": 0, "looked_cost": 0.0, "kept_cost": 0.0, "same": 0}
+          "looked": 0, "looked_cost": 0.0, "kept_cost": 0.0, "same": 0,
+          "mid": None, "unknown": 0}
 SCOUT_MIN_UNITS = 16  # units to look at before the rate so far says anything
 SCOUT_SLACK = 1.0  # ...and how far past the limit it must point (the limit has its own margin)
 
@@ -185,6 +198,130 @@ def text_digest(value):
     return hashlib.sha1(repr(value).encode("utf-8", "backslashreplace")).hexdigest()[:20]
 
 
+def plan_digest(plan):
+    """A fingerprint of a planner.Plan: every step with every attribute, how the
+    steps hang together both ways, and how many there are of each. None if the
+    plan holds anything this does not know how to read.
+
+    Walks the objects directly, like expr_digest. A step is named by what it is
+    and what it depends on, so the fingerprint does not depend on the order in
+    which sets hand out their members.
+    """
+    names = {}  # id(step) -> its name
+    steps = []
+
+    def is_step(value):
+        return type(getattr(value, "dependencies", None)) is set and type(
+            getattr(value, "__dict__", None)
+        ) is dict
+
+    def plain(value, trail):
+        kind = type(value)
+        if value is None or kind in (bool, int, float, str, bytes):
+            return kind.__name__ + ":" + repr(value)
+        args = getattr(value, "args", None)
+        if type(args) is dict and hasattr(value, "parent"):
+            return "E:" + expr_digest(value)
+        if kind is list or kind is tuple:
+            return kind.__name__ + "[" + ",".join(plain(item, trail) for item in value) + "]"
+        if kind is dict:
+            return "{" + ",".join(
+                plain(key, trail) + "=" + plain(item, trail) for key, item in value.items()
+            ) + "}"
+        if kind is set or kind is frozenset:
+            return "set(" + ",".join(sorted(plain(item, trail) for item in value)) + ")"
+        if isinstance(value, type):
+            return "T:" + value.__module__ + "." + value.__qualname__
+        if is_step(value):
+            return "S:" + name_of(value, trail)
+        raise TypeError(kind.__name__)
+
+    def name_of(step, trail):
+        name = names.get(id(step))
+        if name is None:
+            if id(step) in trail:
+                raise ValueError("a step depends on itself")
+            trail = trail | {id(step)}
+            parts = [type(step).__module__ + "." + type(step).__qualname__]
+            for key, value in sorted(vars(step).items()):
+                if key != "dependents":
+                    parts.append(str(key) + "=" + plain(value, trail))
+            name = hashlib.sha1("|".join(parts).encode("utf-8", "backslashreplace")).hexdigest()
+            names[id(step)] = name
+            steps.append(step)
+        return name
+
+    try:
+        parts = []
+        for key, value in sorted(vars(plan).items()):
+            if key != "_dag":  # built from the steps on first use
+                parts.append(str(key) + "=" + plain(value, frozenset()))
+        at = 0
+        while at < len(steps):  # the list grows as dependents bring in more steps
+            step = steps[at]
+            at += 1
+            behind = getattr(step, "dependents", None)
+            if type(behind) is not set:
+                return None
+            for other in behind:
+                name_of(other, frozenset())
+        wiring = sorted(
+            names[id(step)] + "<" + ",".join(sorted(names[id(other)] for other in step.dependents))
+            for step in steps
+        )
+        return text_digest((parts, wiring))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class _NoRows:
+    """Stands in for the executor's tables: the same tables with no rows in them."""
+
+    def __init__(self, tables):
+        self._br_tables = tables
+
+    def find(self, *args, **kwargs):
+        table = self._br_tables.find(*args, **kwargs)
+        if type(getattr(table, "rows", None)) is list and table.rows:
+            return type(table)(table.columns, None, getattr(table, "column_range", None))
+        return table
+
+    def __bool__(self):
+        return bool(self._br_tables)
+
+    def __getattr__(self, name):
+        return getattr(self._br_tables, name)
+
+
+class _Probe:
+    """Build time: runs a plan over no rows, then over the real ones, and notes
+    whether the real run asked for any source the first one did not."""
+
+    def __init__(self, empty, real, mid):
+        self._br = (empty, real, mid)
+
+    def execute(self, plan, *args, **kwargs):
+        empty, real, mid = self._br
+        try:
+            empty.execute(plan, *args, **kwargs)
+        except Exception:  # noqa: BLE001
+            mid["ok"] = False
+        _mid_close(mid)
+        mid["phase"] = "real"
+        return real.execute(plan, *args, **kwargs)
+
+
+def _mid_close(mid):
+    """The fingerprint of a run over no rows: the plan as built, the source of
+    every expression the executor asked for, and the plan as it was left."""
+    plan = mid["plan"]
+    after = plan_digest(plan) if plan is not None else None
+    if mid["first"] is None or after is None or not mid["made"]:
+        mid["digest"] = None
+    else:
+        mid["digest"] = text_digest((_STAGE["tables"], mid["first"], sorted(mid["pairs"]), after))
+
+
 def _stage_install(test):
     """Wrap the optimizer as the executor calls it, and the test module's own
     `execute` and `transpile`. Returns False if the names are not there."""
@@ -201,6 +338,15 @@ def _stage_install(test):
         }
     except Exception:  # noqa: BLE001
         return False
+    record = STAGED.get(getattr(test, "_br_id", None)) if STAGE_TRACE is None else None
+    probing = STAGE_TRACE is not None and getattr(STAGE_TRACE, "probe", False)
+    if probing or (record is not None and record.get("mid_cut")):
+        try:
+            saved["Plan"] = executor.Plan
+            saved["PythonExecutor"] = executor.PythonExecutor
+            saved["generate"] = executor.PythonExecutor.__dict__["generate"]
+        except Exception:  # noqa: BLE001
+            return False
 
     def optimize(*args, **kwargs):
         result = saved["optimize"](*args, **kwargs)
@@ -227,7 +373,75 @@ def _stage_install(test):
     def execute(*args, **kwargs):
         tables = kwargs.get("tables")
         _STAGE["tables"] = sorted(map(str, tables)) if type(tables) is dict else None
-        return saved["execute"](*args, **kwargs)
+        if "generate" not in saved:
+            return saved["execute"](*args, **kwargs)
+        unit = _STAGE["unit"]
+        record = _STAGE["record"]
+        expected = None
+        if not probing:
+            if unit is None or record is None or unit in _STAGE["full"]:
+                return saved["execute"](*args, **kwargs)
+            fingerprints = record.get("mid") or ()
+            expected = fingerprints[unit] if unit < len(fingerprints) else None
+            if expected is None:
+                if record.get("scout"):
+                    _STAGE["unknown"] |= 1 << unit
+                    raise _Differs()
+                return saved["execute"](*args, **kwargs)
+        mid = {"plan": None, "first": None, "pairs": [], "phase": "empty", "made": False,
+               "probe": probing, "ok": True, "seen": {}, "digest": None}
+        _STAGE["mid"] = mid
+        try:
+            result = saved["execute"](*args, **kwargs)
+            if not probing:
+                _mid_close(mid)
+        except Exception:  # noqa: BLE001
+            if probing:
+                raise
+            mid["digest"] = None
+        finally:
+            _STAGE["mid"] = None
+        if probing:
+            STAGE_TRACE.mid(unit, mid["digest"] if mid["ok"] else None)
+            return result
+        if mid["digest"] is not None and mid["digest"] == expected:
+            raise _Unchanged()
+        if record.get("scout"):
+            raise _Differs()
+        return saved["execute"](*args, **kwargs)  # over the rows this time
+
+    def make_plan(*args, **kwargs):
+        plan = saved["Plan"](*args, **kwargs)
+        mid = _STAGE["mid"]
+        if mid is not None and mid["plan"] is None:
+            mid["plan"] = plan
+            mid["first"] = plan_digest(plan)
+        return plan
+
+    def make_executor(*args, **kwargs):
+        mid = _STAGE["mid"]
+        if mid is None or mid["made"] or "tables" not in kwargs:
+            return saved["PythonExecutor"](*args, **kwargs)
+        mid["made"] = True
+        empty = saved["PythonExecutor"](*args, **dict(kwargs, tables=_NoRows(kwargs["tables"])))
+        if not mid["probe"]:
+            return empty
+        return _Probe(empty, saved["PythonExecutor"](*args, **kwargs), mid)
+
+    def generate(self, expression):
+        code = saved["generate"](self, expression)
+        mid = _STAGE["mid"]
+        if mid is not None:
+            source = getattr(code, "co_filename", None)
+            if mid["phase"] == "empty":
+                mid["pairs"].append((expr_digest(expression), source))
+                if mid["probe"]:
+                    mid["seen"][id(expression)] = (expression, source)
+            else:
+                seen = mid["seen"].get(id(expression))
+                if seen is None or seen[0] is not expression or seen[1] != source:
+                    mid["ok"] = False  # the rows led to source the first run never made
+        return code
 
     def transpile(*args, **kwargs):
         if STAGE_TRACE is None:
@@ -243,6 +457,10 @@ def _stage_install(test):
     executor.optimize = optimize
     module.execute = execute
     module.transpile = transpile
+    if "generate" in saved:
+        executor.Plan = make_plan
+        executor.PythonExecutor = make_executor
+        saved["PythonExecutor"].generate = generate
     _STAGE["saved"] = saved
     return True
 
@@ -253,7 +471,12 @@ def _stage_remove():
         saved["executor"].optimize = saved["optimize"]
         saved["module"].execute = saved["execute"]
         saved["module"].transpile = saved["transpile"]
+        if "generate" in saved:
+            saved["executor"].Plan = saved["Plan"]
+            saved["executor"].PythonExecutor = saved["PythonExecutor"]
+            saved["PythonExecutor"].generate = saved["generate"]
     _STAGE.update(record=None, unit=None, tables=None, saved=None, entries=None, differs=0)
+    _STAGE.update(mid=None, unknown=0)
     _STAGE.update(spent=0.0, over=False, looked=0, looked_cost=0.0)
     _STAGE["full"] = set()
 
@@ -721,6 +944,8 @@ class Result(unittest.TestResult):
         if _STAGE["saved"] is not None:
             if _STAGE["differs"]:
                 STAGE_DIFFERS[test_id] = _STAGE["differs"]
+                if _STAGE["unknown"]:
+                    STAGE_UNKNOWN[test_id] = _STAGE["unknown"]
                 self.unsure.add(test_id)  # those units have not been run
                 if _STAGE["over"]:
                     STAGE_OVER.add(test_id)
