@@ -68,13 +68,20 @@ NOT_RUN = "left out by the verifier"
 # the changed units cost more than that, or once enough units have been looked
 # at that, at the rate seen so far, the units still to come would take it well
 # past that: the test is then in STAGE_OVER.
+#
+# Whatever the change, a unit that does run to the end hands back a table. The
+# test then runs the same query in duckdb and compares the two, which is half
+# of its cost and none of it sqlglot's code. When the SQL handed to duckdb is
+# what it was and the table has the fingerprint recorded at the pinned commit
+# (every cell's type and value, in order), that comparison comes out as it did
+# then, so it is skipped. A record with "front_ok" false allows only this.
 STAGED: dict = {}  # test id -> its record from the maps (see br/stages.py)
 STAGE_DIFFERS: dict = {}  # test id -> bitset of the units a scouting run found changed
 STAGE_OVER: set = set()  # test ids whose scouting run was ended early
 STAGE_TRACE = None  # build time: the recorder
 _STAGE = {"record": None, "unit": None, "full": set(), "tables": None, "saved": None,
           "entries": None, "cut": 0, "differs": 0, "spent": 0.0, "over": False,
-          "looked": 0, "looked_cost": 0.0, "kept_cost": 0.0}
+          "looked": 0, "looked_cost": 0.0, "kept_cost": 0.0, "same": 0}
 SCOUT_MIN_UNITS = 16  # units to look at before the rate so far says anything
 SCOUT_SLACK = 1.0  # ...and how far past the limit it must point (the limit has its own margin)
 
@@ -146,6 +153,34 @@ def expr_digest(node):
     return digest.hexdigest()[:20]
 
 
+# Cell types whose equality and printed form no patch to sqlglot can change.
+_PLAIN = frozenset(("builtins", "datetime", "decimal"))
+
+
+def table_digest(table):
+    """A fingerprint of an executor result as the test reads it: `columns`, then every
+    cell of `rows` with its type. None if anything in it is not a plain value."""
+    try:
+        columns = table.columns
+        rows = table.rows
+        if type(columns) is not tuple or type(rows) is not list:
+            return None
+        digest = hashlib.sha1(repr(columns).encode("utf-8", "backslashreplace"))
+        feed = digest.update
+        for row in rows:
+            if type(row) is not tuple and type(row) is not list:
+                return None
+            feed(b"|%d" % len(row))
+            for cell in row:
+                kind = type(cell)
+                if kind.__module__ not in _PLAIN:
+                    return None
+                feed(kind.__name__.encode() + b":" + repr(cell).encode("utf-8", "backslashreplace") + b";")
+        return digest.hexdigest()[:20]
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def text_digest(value):
     return hashlib.sha1(repr(value).encode("utf-8", "backslashreplace")).hexdigest()[:20]
 
@@ -176,7 +211,7 @@ def _stage_install(test):
             STAGE_TRACE.front(unit, text_digest((_STAGE["tables"], expr_digest(result))))
             return result
         record = _STAGE["record"]
-        if record is None or unit >= len(record["front"]):
+        if record is None or unit >= len(record["front"]) or not record.get("front_ok", True):
             return result
         expected = record["front"][unit]
         if (
@@ -275,6 +310,21 @@ def _execute(future, fn, args, kwargs):
         _STAGE["tables"] = None
     try:
         result = pickle.loads(pickle.dumps(fn(*args, **kwargs)))
+        if staged and result is not None:
+            if STAGE_TRACE is not None:
+                STAGE_TRACE.result(unit, table_digest(result))
+            else:
+                record = _STAGE["record"]
+                recorded = (record or {}).get("result") or ()
+                if (
+                    unit not in _STAGE["full"]
+                    and unit < len(recorded)
+                    and recorded[unit] is not None
+                    and table_digest(result) == recorded[unit]
+                ):
+                    # The comparison with duckdb would come out as it did.
+                    _STAGE["same"] += 1
+                    result = None
     except (_Unchanged, _Differs) as outcome:
         unit = future._br_unit
         record = _STAGE["record"] or {}
@@ -627,6 +677,7 @@ class Result(unittest.TestResult):
                 _STAGE["record"] = STAGED.get(test_id) if STAGE_TRACE is None else None
                 _STAGE["entries"] = getattr(type(test), UNIT_LISTS[test_id], None)
                 _STAGE["cut"] = 0
+                _STAGE["same"] = 0
                 costs = (_STAGE["record"] or {}).get("costs") or ()
                 _STAGE["kept_cost"] = sum(
                     cost

@@ -22,6 +22,9 @@ MAX_WORKERS = 8
 
 # CPU seconds the scorer charges for work recorded as one second of test time.
 CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.0"))
+# The same for tests whose cost here was measured when the maps were built (the
+# ones that hand work to a process pool) instead of taken from tests.json.
+OWN_FACTOR = float(os.environ.get("BR_OWN_FACTOR", str(CPU_FACTOR)))
 
 P_FAIL = 0.5  # chance that a change which reaches candidates breaks at least one
 EARLY = 0.25  # share of the checking done before a failure shows, when there is one
@@ -41,8 +44,14 @@ DEAR = 1.3  # tests costing more than this many times their recorded time are "d
 GIANT_CPU = 3.0
 LATE_PASS = 0.8  # chance a giant passes when everything else did
 LATE_ALONE = 0.5  # ...when nothing else was run
-LATE_FLOOR = 0.3  # ...at the least, however many of the others failed
-LATE_EARLY = 0.3  # share of a giant's cost spent before it fails, when it fails
+# ...when something else failed. How many of the others failed says little about
+# a giant: over generated edits that test_execute_tpcds runs it passed in about
+# six of ten, whether or not other tests failed.
+LATE_AFTER_FAILURE = 0.6
+# Share of a giant's cost spent before it fails, when it fails: 52 of 54 failing
+# runs of test_execute_tpcds had failed within three tenths of a full run, most
+# within one tenth.
+LATE_EARLY = 0.2
 # When a giant that does its work in units (the executor's TPC-DS test: one
 # query a unit) is run here, its cheapest units go first, in a pass of their
 # own, so that a failure shows early. They are no evidence for the rest: of 19
@@ -306,7 +315,7 @@ class Policy:
         without = pack(list(scheduled), self.ms)[0] / 1000
         added = pack(list(scheduled) + [number], self.ms)[0] / 1000 - without
         if failed:
-            passing = min(LATE_PASS, max(LATE_FLOOR, (passed + 1) / (passed + failed + 2)))
+            passing = LATE_AFTER_FAILURE
         else:
             passing = LATE_PASS if passed else LATE_ALONE
         passing *= 1.0 - changed
@@ -366,7 +375,9 @@ def plan_slices(maps, policy, indexes, full, targets, cell_targets, no_slice):
         stage = maps.stages().get(maps.tests[index])
         if stage and STAGES and _stageable(stage, targets):
             # Each unit is cut short after the optimizer unless what it hands on changed.
+            # (the test's cost already allows for skipped comparisons: see selector.py)
             cost *= max(stage["share"], STAGE_SHARE_MIN) * STAGE_SLACK
+            cost /= stage.get("result_share", 1.0) if any(stage.get("result") or ()) else 1.0
             slices[("staged", index)] = True
         slices[index] = (units["mode"], keep, count, cost)
     if STMTS and targets and not cell_targets:

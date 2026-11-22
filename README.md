@@ -116,17 +116,31 @@ that is worth it (the more of them changed, the less likely they all still
 give the same rows), and otherwise the test is scheduled. The first pass
 stops early once so much has changed that the test would be scheduled anyway.
 
+**The comparison with duckdb, skipped** (`stage_prints.json` again). Half of
+what `test_execute_tpcds` costs is not sqlglot at all: for every query it runs
+the same SQL in duckdb and compares the two tables. The build also records a
+fingerprint of the table sqlglot's executor returns for each query (every
+cell's type and value, in order). When a query's result has that fingerprint
+and the SQL handed to duckdb is unchanged, the comparison comes out as it did
+at the pinned commit, so it is not made. This holds for any kind of change,
+and brings a full run of the test down to about four tenths of its cost; a
+query whose result differs is compared for real.
+
 **The two giants.** `test_execute_tpcds` and `test_max_nodes` are recorded at
-about 21 s and 29 s and cost more than that in CPU to run here in full, so
-they are never run in full. They are settled last, on what the other
-candidates showed:
+about 21 s and 29 s. They are settled last, on what the other candidates
+showed:
 
 - *Left out on evidence* (`BR_PROBE=1`): every other test that runs the changed
   statement was run and passed, and there were at least a dozen. That is
   evidence, not proof. With `BR_PROBE=0` this is never done.
 - *Checked after the optimizer*: `test_execute_tpcds`, when the check above
   applies. Exact.
-- *Scheduled*: when none applies, or the check would cost more than it can save.
+- *Run to the end*: `test_execute_tpcds`, with the comparison skipped as above,
+  when the seconds it would add to the schedule, times the chance that it
+  passes, come to more than the run. It fails early when it fails: 52 of 54
+  failing runs over generated edits had failed within three tenths of a run.
+- *Scheduled*: otherwise. `test_max_nodes` costs more to run here than to
+  schedule and is never run.
 
 **Units of a test are not isolated.** A pooled test is cut down to the units of
 work that reach a change only for edits to function bodies. sqlglot builds

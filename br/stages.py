@@ -7,10 +7,13 @@ For each test in runner.UNIT_LISTS, run once at the pinned commit, this records
   front   per unit, a fingerprint of the optimized expression and the tables the
           executor is given (None for a unit that executes nothing);
   duck    per unit, a fingerprint of the SQL the test hands to duckdb;
+  result  per unit, a fingerprint of the table the executor returns;
   back    the sqlglot lines that run after the optimizer returns: planning,
           execution, and the comparison of the rows;
   share   the CPU of a run that is cut short after the optimizer, as a share
-          of a full run.
+          of a full run;
+  result_share  the CPU of a run that executes every query but skips the
+          comparison with duckdb wherever the result is as recorded.
 
 At run time (runner.STAGED) a unit whose fingerprints still match is cut short
 right after the optimizer. That is only done for a change none of whose lines
@@ -31,6 +34,7 @@ class Recorder:
         self.prefix = os.path.join(root, "sqlglot") + os.sep
         self.front_prints = {}
         self.duck_prints = {}
+        self.result_prints = {}
         self.duck_kwargs = None
         self.sound = True
         self.back = {}
@@ -73,6 +77,11 @@ class Recorder:
             self.sound = False  # a unit that optimizes twice is not what this models
         self.front_prints[unit] = fingerprint
         self._set(True)
+
+    def result(self, unit, fingerprint):
+        if unit in self.result_prints:
+            self.sound = False
+        self.result_prints[unit] = fingerprint
 
     def pause(self):
         self.paused = self.tracing
@@ -140,6 +149,7 @@ def main(argv):
         record = {
             "front": [recorder.front_prints.get(unit) for unit in range(count)],
             "duck": [recorder.duck_prints.get(unit) for unit in range(count)],
+            "result": [recorder.result_prints.get(unit) for unit in range(count)],
             "duck_kwargs": recorder.duck_kwargs or {},
             "back": {source: sorted(lines) for source, lines in sorted(recorder.back.items())},
         }
@@ -157,10 +167,28 @@ def main(argv):
             print(test_id, f"staged run does not hold: failed={bool(failed)} cut {cut} of {executed}")
             continue
         record["share"] = round(timings[test_id] / whole, 4) if whole > 0 else 1.0
+
+        # 4. Every query executed, the comparison skipped where the result is as recorded.
+        runner.STAGED[test_id] = dict(record, front_ok=False)
+        timings = {}
+        try:
+            failed, _, _ = runner.run([test_id], timings=timings)
+        finally:
+            runner.STAGED.pop(test_id, None)
+        same = runner._STAGE["same"]
+        known = sum(1 for value in record["result"] if value is not None)
+        if failed or same != known or known != executed:
+            print(test_id, f"results do not repeat: failed={bool(failed)} same {same} of {known}")
+            record["result"] = [None] * count
+            record["result_share"] = 1.0
+        else:
+            record["result_share"] = round(timings[test_id] / whole, 4) if whole > 0 else 1.0
         found[test_id] = record
         print(
             test_id,
-            f"{executed} of {count} units execute, whole {whole:.2f}s, staged {timings[test_id]:.2f}s,"
+            f"{executed} of {count} units execute, whole {whole:.2f}s, "
+            f"cut after the optimizer {record['share'] * whole:.2f}s, "
+            f"comparison skipped {record['result_share'] * whole:.2f}s,"
             f" {sum(len(lines) for lines in record['back'].values())} lines in"
             f" {len(record['back'])} files after the optimizer",
         )

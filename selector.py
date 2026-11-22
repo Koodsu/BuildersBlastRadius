@@ -26,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from br import analyze, verify  # noqa: E402
-from br.policy import CPU_FACTOR, Policy, pack, plan_slices, slice_cost  # noqa: E402
+from br.policy import CPU_FACTOR, OWN_FACTOR, Policy, pack, plan_slices, slice_cost  # noqa: E402
 
 DATA = os.environ.get("BR_DATA", "/data")
 MAPS = os.environ.get("BR_MAPS", os.path.join(HERE, "maps"))
@@ -143,15 +143,20 @@ def main():
         if number is not None and not test_id.startswith(POOLED):
             cpu.append(ms[number] / 1000 * CPU_FACTOR)
         else:
-            cpu.append(ours[i] * scale * CPU_FACTOR)
+            cpu.append(ours[i] * scale * OWN_FACTOR)
     setup_cost = {
-        key: value * scale * CPU_FACTOR
+        key: value * scale * OWN_FACTOR
         for key, value in (meta.get("class_setup") or {}).items()
     }
     order = {test["id"]: position for position, test in enumerate(tests)}
     policy = Policy(
         maps.tests, to_number, ms, cpu, setup_cost, order, unknown, bare=meta.get("no_setup", ())
     )
+    # A test whose results are on record skips its comparison with duckdb where
+    # they come out the same (see runner.STAGED): a run of it costs that much less.
+    for test_id, record in maps.stages().items():
+        if test_id in maps.tests and any(record.get("result") or ()):
+            policy.cpu[maps.tests.index(test_id)] *= record.get("result_share", 1.0)
     log(f"timing scale {scale:.2f}")
 
     waiting = []  # analyses that need a verifier
@@ -627,7 +632,7 @@ def run_jobs(jobs, maps, policy, output):
                 elif line == b"A":
                     job.announced = True
                     # Costs are the scorer's; allow for a much slower machine.
-                    estimate = sum(policy.cpu[i] for i in job.verify) / CPU_FACTOR
+                    estimate = sum(policy.cpu[i] for i in job.verify) / min(CPU_FACTOR, OWN_FACTOR)
                     job.deadline = now + (
                         3600.0 if AUDIT else (30.0 + 6.0 * estimate) * verify.SLOW
                     )
@@ -648,7 +653,8 @@ def run_jobs(jobs, maps, policy, output):
                         job.deadline = now + (
                             3600.0
                             if AUDIT
-                            else (90.0 + 5.0 * policy.cpu[number] / CPU_FACTOR) * verify.SLOW
+                            else (90.0 + 5.0 * policy.cpu[number] / min(CPU_FACTOR, OWN_FACTOR))
+                            * verify.SLOW
                         )
                     elif kind == b"V":
                         job.verify.append(number)

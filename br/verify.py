@@ -40,9 +40,10 @@ import time
 import types
 
 from br import analyze, cells
-from br.policy import CPU_FACTOR, PREFIX_SHARE, PROBE_MIN, plan_slices, slice_cost
+from br.policy import CPU_FACTOR, OWN_FACTOR, PREFIX_SHARE, PROBE_MIN, plan_slices, slice_cost
 
 HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")
+LIMIT_FACTOR = min(CPU_FACTOR, OWN_FACTOR)  # time limits stay in recorded seconds
 WALL_END = None  # time.monotonic() at which the selector stops waiting for verifiers
 SLOW = float(os.environ.get("BR_SLOW", "1"))  # development: stretch time limits on a slow machine
 
@@ -560,9 +561,13 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                     runner.STMT[name] = (record, part[0])
                     cut += 1
             # In recorded seconds: generous, it only has to catch a hang.
-            limits[name] = (3.0 + 4.0 * cost_of(i) / CPU_FACTOR) * SLOW
+            limits[name] = (3.0 + 4.0 * cost_of(i) / LIMIT_FACTOR) * SLOW
+            record = maps.stages().get(name)
+            if record and i not in by_entry and ("staged", i) not in slices:
+                # Every unit runs; only the comparison with duckdb is skipped where
+                # the result is as recorded. That holds whatever was changed.
+                runner.STAGED[name] = dict(record, front_ok=False)
             if ("staged", i) in slices:
-                record = maps.stages().get(name)
                 if record and maps.units(i) is not None:
                     # A first run only finds the units whose plan changed; whether
                     # those are then run is decided once their cost is known. It ends
@@ -575,7 +580,7 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
                         stop_at=scout_limit(i, len(to_verify), 0, others) * policy.cpu[i],
                     )
                     staged += 1
-                    limits[name] = (3.0 + 4.0 * policy.cpu[i] / CPU_FACTOR) * SLOW
+                    limits[name] = (3.0 + 4.0 * policy.cpu[i] / LIMIT_FACTOR) * SLOW
             if DUAL_AUDIT or STMT_AUDIT:
                 limits[name] = 900.0  # measuring on a busy machine: no false alarms
         if cut:
@@ -717,8 +722,9 @@ def child(base, job, mode, policy, maps, write_fd, memory_bytes, log_fd=None, in
             name = policy.tests[i]
             passes = None
             units = maps.units(i) if name in runner.UNIT_LISTS else None
-            if i in scouted:
-                runner.STAGED.pop(name, None)  # the units that changed, in full this time
+            if i in scouted and name in runner.STAGED:
+                # The units that changed, to the end this time.
+                runner.STAGED[name] = dict(maps.stages()[name], front_ok=False)
             if i in by_entry:
                 runner.ENTRY[name] = by_entry[i][:4]
             elif ("staged", i) in slices and i not in scouted:
