@@ -150,19 +150,23 @@ def code_lines(source):
     return found
 
 
+FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
 def _index(tree):
     nodes = []
 
-    def visit(node, depth):
+    def visit(node, depth, in_function):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.stmt, ast.ExceptHandler, ast.Lambda)):
                 low = child.lineno
                 for decorator in getattr(child, "decorator_list", ()):
                     low = min(low, decorator.lineno)
+                child._br_in_function = in_function
                 nodes.append((low, child.end_lineno, depth, child))
-            visit(child, depth + 1)
+            visit(child, depth + 1, in_function or isinstance(child, FUNCS))
 
-    visit(tree, 0)
+    visit(tree, 0, False)
     return nodes
 
 
@@ -175,9 +179,6 @@ def _innermost(nodes, low, high, kinds=None):
     return best
 
 
-FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-
-
 def _body_range(low, high, node):
     """Lines that run when the function is called (not when it is defined)."""
     if isinstance(node, ast.Lambda):
@@ -187,11 +188,50 @@ def _body_range(low, high, node):
     return set(range(node.body[0].lineno, high + 1))
 
 
-def reach(old_source, new_source, groups):
+def assigned_names(node):
+    """Names a class-level or module-level assignment binds, or None if it is not a plain one."""
+    if getattr(node, "_br_in_function", True):
+        return None
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        targets = [node.target]
+    else:
+        return None
+    if all(isinstance(target, ast.Name) for target in targets):
+        return frozenset(target.id for target in targets)
+    return None
+
+
+def references(source, names):
+    """Lines of source that read one of the names (as a variable, an attribute or a string)."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return ALL
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            hit = node.attr in names and not isinstance(node.ctx, ast.Store)
+        elif isinstance(node, ast.Name):
+            hit = node.id in names and not isinstance(node.ctx, ast.Store)
+        elif isinstance(node, ast.Constant):
+            hit = isinstance(node.value, str) and node.value in names
+        else:
+            hit = False
+        if hit:
+            found.update(range(node.lineno, node.end_lineno + 1))
+    return found
+
+
+def reach(old_source, new_source, groups, narrow=None):
     """Old-file lines whose execution a test needs for the change to matter to it.
 
     Returns a set of line numbers, or ALL when the change cannot be pinned to lines.
-    An empty set means the two versions are the same program.
+    An empty set (and nothing in narrow) means the two versions are the same program.
+    narrow collects (lines, names) for changed class-level and module-level assignments:
+    such a change matters only to tests that run those lines (they import the module)
+    and also run some line that reads one of the names.
     """
     try:
         old_tree = ast.parse(old_source)
@@ -235,5 +275,9 @@ def reach(old_source, new_source, groups):
             elif isinstance(getattr(node, "body", None), list) and node.body:
                 out |= set(range(low, max(low, node.body[0].lineno - 1) + 1))
             else:
-                out |= set(range(low, high + 1))
+                names = assigned_names(node)
+                if names and narrow is not None:
+                    narrow.append((frozenset(range(low, high + 1)), names))
+                else:
+                    out |= set(range(low, high + 1))
     return out

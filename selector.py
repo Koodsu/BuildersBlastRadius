@@ -126,13 +126,44 @@ def analyze(maps, patch_text):
         if new_text == old_text:
             continue
         if new_path.endswith(".py"):
-            wanted = patching.reach(old_text, new_text, groups)
+            narrow = []
+            wanted = patching.reach(old_text, new_text, groups, narrow)
             reach[new_path] = wanted
             if wanted is patching.ALL:
                 mask |= maps.lines(new_path, patching.ALL) | maps.readers("f:" + new_path)
-            elif wanted:
+                continue
+            if wanted:
                 mask |= maps.lines(new_path, wanted)
+            for lines, names in narrow:
+                reach[new_path] = reach[new_path] | lines
+                importers = maps.lines(new_path, lines)
+                if importers:
+                    mask |= importers & readers_of(maps, names)
     return mask, changes, reach
+
+
+_sources = None
+
+
+def readers_of(maps, names):
+    """Tests that run a line which reads one of the names, anywhere in sqlglot or its tests."""
+    global _sources
+    if _sources is None:
+        _sources = {}
+        for top in ("sqlglot", "tests"):
+            for folder, _, files in os.walk(os.path.join(SG, top)):
+                for name in files:
+                    if name.endswith(".py"):
+                        full = os.path.join(folder, name)
+                        with open(full, encoding="utf-8") as handle:
+                            _sources[os.path.relpath(full, SG)] = handle.read()
+    mask = 0
+    for path, source in _sources.items():
+        if path in maps.files and any(name in source for name in names):
+            lines = patching.references(source, names)
+            if lines:
+                mask |= maps.lines(path, lines)
+    return mask
 
 
 def build_overlay(root, changes):
